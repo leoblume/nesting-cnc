@@ -87,6 +87,88 @@ function toPolygon(path: Point[]): Polygon | null {
   return poly;
 }
 
+// ─── Internal op-codes used inside pdfjs constructPath Float32Array ───────────
+// These are NOT the same as OPS constants. They encode the sub-operations
+// packed into the constructPath typed-array payload introduced in pdfjs ≥ 4.
+const CP_MOVE_TO   = 0; // followed by x, y
+const CP_LINE_TO   = 1; // followed by x, y
+const CP_CURVE_TO  = 2; // followed by x1,y1, x2,y2, x3,y3
+const CP_CLOSE     = 4; // no arguments
+
+/**
+ * Decode a pdfjs constructPath Float32Array into an array of Polygons.
+ * constructPath(args) = [fillOp, [Float32Array]]
+ * The Float32Array interleaves op-codes and coordinate values.
+ */
+function decodeConstructPath(pathArray: Float32Array, steps = 16): Polygon[] {
+  const polys: Polygon[] = [];
+  let current: Point[] = [];
+  let cursor: Point | null = null;
+  let subpaths: Point[][] = [];
+
+  const flushCurrent = () => {
+    if (current.length >= 3) subpaths.push([...current]);
+    current = [];
+    cursor = null;
+  };
+
+  const flushAll = () => {
+    flushCurrent();
+    for (const sp of subpaths) {
+      const poly = toPolygon(sp);
+      if (poly) polys.push(poly);
+    }
+    subpaths = [];
+  };
+
+  let i = 0;
+  while (i < pathArray.length) {
+    const op = pathArray[i++];
+
+    switch (op) {
+      case CP_MOVE_TO: {
+        flushCurrent();
+        const x = pathArray[i++];
+        const y = pathArray[i++];
+        cursor = [x, y];
+        current.push(cursor);
+        break;
+      }
+      case CP_LINE_TO: {
+        if (!cursor) { i += 2; break; }
+        const x = pathArray[i++];
+        const y = pathArray[i++];
+        const p: Point = [x, y];
+        current.push(p);
+        cursor = p;
+        break;
+      }
+      case CP_CURVE_TO: {
+        if (!cursor) { i += 6; break; }
+        const p1: Point = [pathArray[i++], pathArray[i++]];
+        const p2: Point = [pathArray[i++], pathArray[i++]];
+        const p3: Point = [pathArray[i++], pathArray[i++]];
+        current.push(...discretizeBezier(cursor, p1, p2, p3, steps));
+        cursor = p3;
+        break;
+      }
+      case CP_CLOSE: {
+        if (current.length >= 3) subpaths.push([...current]);
+        current = [];
+        cursor = null;
+        break;
+      }
+      default:
+        // Unknown op — skip (may be new op in future pdfjs). Stop to avoid runaway.
+        i = pathArray.length;
+        break;
+    }
+  }
+
+  flushAll();
+  return polys;
+}
+
 async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
   const opList = await page.getOperatorList();
   const OPS = pdfjsLib.OPS;
@@ -121,6 +203,19 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
     const args = opList.argsArray[i];
 
     switch (fn) {
+      // ── pdfjs ≥ 4 bundles ALL path ops into a single constructPath call ──
+      case OPS.constructPath: {
+        // args = [fillStrokeOp, [Float32Array]]
+        // The Float32Array contains interleaved sub-op codes + coords.
+        const pathData: Float32Array | undefined = args?.[1]?.[0];
+        if (pathData instanceof Float32Array) {
+          const decoded = decodeConstructPath(pathData, 16);
+          polys.push(...decoded);
+        }
+        break;
+      }
+
+      // ── Legacy individual path operators (pdfjs < 4 / simple PDFs) ──────
       case OPS.moveTo: {
         // moveTo starts a new subpath — flush current but keep subpaths
         flushCurrent();
