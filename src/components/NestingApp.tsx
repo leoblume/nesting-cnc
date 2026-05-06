@@ -198,11 +198,11 @@ export default function NestingApp() {
                 <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <div>
                   <p className="font-medium">Erro ao interpretar</p>
-                  <p className="mt-0.5 leading-relaxed">{parseError}</p>
+                  {parseError.split("\n").map((line, i) => (
+                    <p key={i} className="mt-0.5 leading-relaxed">{line}</p>
+                  ))}
                   <p className="mt-1 text-muted-foreground">
-                    ✔ Aceitos: CAD (DXF→PDF), CorelDRAW, Illustrator, Inkscape
-                    <br />
-                    ✘ Não aceitos: PDF digitalizado / rasterizado
+                    ✔ Compatível com: CorelDRAW, Illustrator, Inkscape, AutoCAD (DXF→PDF)
                   </p>
                 </div>
               </div>

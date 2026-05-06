@@ -4,7 +4,7 @@ import type { Polygon } from "./geometry";
 import {
   buildGeometry,
   polygonArea,
-  polygonContains,
+  pointInPolygon,
   normalizeToOrigin,
   bbox,
   type PartGeometry,
@@ -13,8 +13,7 @@ import {
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const PT_TO_MM = 25.4 / 72;
-// Área mínima reduzida para capturar peças pequenas
-const MIN_AREA_MM2 = 1;
+const MIN_AREA_MM2 = 0.5; // limiar menor para capturar peças pequenas
 
 export interface ParsedPart extends PartGeometry {
   id: string;
@@ -27,39 +26,20 @@ function mm(v: number) {
 }
 
 function bezierPoint(
-  p0: Point,
-  p1: Point,
-  p2: Point,
-  p3: Point,
-  t: number,
+  p0: Point, p1: Point, p2: Point, p3: Point, t: number,
 ): Point {
   const mt = 1 - t;
-  const x =
-    mt * mt * mt * p0[0] +
-    3 * mt * mt * t * p1[0] +
-    3 * mt * t * t * p2[0] +
-    t * t * t * p3[0];
-
-  const y =
-    mt * mt * mt * p0[1] +
-    3 * mt * mt * t * p1[1] +
-    3 * mt * t * t * p2[1] +
-    t * t * t * p3[1];
-
-  return [x, y];
+  return [
+    mt ** 3 * p0[0] + 3 * mt ** 2 * t * p1[0] + 3 * mt * t ** 2 * p2[0] + t ** 3 * p3[0],
+    mt ** 3 * p0[1] + 3 * mt ** 2 * t * p1[1] + 3 * mt * t ** 2 * p2[1] + t ** 3 * p3[1],
+  ];
 }
 
 function discretizeBezier(
-  p0: Point,
-  p1: Point,
-  p2: Point,
-  p3: Point,
-  steps = 16,
+  p0: Point, p1: Point, p2: Point, p3: Point, steps = 16,
 ): Point[] {
   const pts: Point[] = [];
-  for (let i = 1; i <= steps; i++) {
-    pts.push(bezierPoint(p0, p1, p2, p3, i / steps));
-  }
+  for (let i = 1; i <= steps; i++) pts.push(bezierPoint(p0, p1, p2, p3, i / steps));
   return pts;
 }
 
@@ -69,42 +49,21 @@ function closeEnough(a: Point, b: Point, eps = 0.5) {
 
 function toPolygon(path: Point[]): Polygon | null {
   if (path.length < 3) return null;
-
   const first = path[0];
   const last = path[path.length - 1];
-
-  if (!closeEnough(first, last)) {
-    path = [...path, first];
-  }
-
-  const poly = path.map(([x, y]) => ({
-    x: mm(x),
-    y: mm(y),
-  }));
-
+  if (!closeEnough(first, last)) path = [...path, first];
+  const poly = path.map(([x, y]) => ({ x: mm(x), y: mm(y) }));
   if (polygonArea(poly) < MIN_AREA_MM2) return null;
-
   return poly;
 }
 
-// ─── Internal op-codes used inside pdfjs constructPath Float32Array ───────────
-// These are NOT the same as OPS constants. They encode the sub-operations
-// packed into the constructPath typed-array payload introduced in pdfjs ≥ 4.
-const CP_MOVE_TO   = 0; // followed by x, y
-const CP_LINE_TO   = 1; // followed by x, y
-const CP_CURVE_TO  = 2; // followed by x1,y1, x2,y2, x3,y3
-const CP_CLOSE     = 4; // no arguments
-
-/**
- * Decode a pdfjs constructPath Float32Array into an array of Polygons.
- * constructPath(args) = [fillOp, [Float32Array]]
- * The Float32Array interleaves op-codes and coordinate values.
- */
+// ─── pdfjs ≥ 4: constructPath Float32Array sub-op codes ──────────────────────
+// 0 = moveTo(x,y)   1 = lineTo(x,y)   2 = curveTo(x1,y1,x2,y2,x3,y3)   4 = closePath
 function decodeConstructPath(pathArray: Float32Array, steps = 16): Polygon[] {
   const polys: Polygon[] = [];
   let current: Point[] = [];
   let cursor: Point | null = null;
-  let subpaths: Point[][] = [];
+  const subpaths: Point[][] = [];
 
   const flushCurrent = () => {
     if (current.length >= 3) subpaths.push([...current]);
@@ -118,50 +77,39 @@ function decodeConstructPath(pathArray: Float32Array, steps = 16): Polygon[] {
       const poly = toPolygon(sp);
       if (poly) polys.push(poly);
     }
-    subpaths = [];
+    subpaths.length = 0;
   };
 
   let i = 0;
   while (i < pathArray.length) {
     const op = pathArray[i++];
-
-    switch (op) {
-      case CP_MOVE_TO: {
-        flushCurrent();
-        const x = pathArray[i++];
-        const y = pathArray[i++];
-        cursor = [x, y];
-        current.push(cursor);
-        break;
-      }
-      case CP_LINE_TO: {
-        if (!cursor) { i += 2; break; }
-        const x = pathArray[i++];
-        const y = pathArray[i++];
-        const p: Point = [x, y];
-        current.push(p);
-        cursor = p;
-        break;
-      }
-      case CP_CURVE_TO: {
-        if (!cursor) { i += 6; break; }
-        const p1: Point = [pathArray[i++], pathArray[i++]];
-        const p2: Point = [pathArray[i++], pathArray[i++]];
-        const p3: Point = [pathArray[i++], pathArray[i++]];
-        current.push(...discretizeBezier(cursor, p1, p2, p3, steps));
-        cursor = p3;
-        break;
-      }
-      case CP_CLOSE: {
-        if (current.length >= 3) subpaths.push([...current]);
-        current = [];
-        cursor = null;
-        break;
-      }
-      default:
-        // Unknown op — skip (may be new op in future pdfjs). Stop to avoid runaway.
-        i = pathArray.length;
-        break;
+    if (op === 0) {
+      // moveTo
+      flushCurrent();
+      cursor = [pathArray[i++], pathArray[i++]];
+      current.push(cursor);
+    } else if (op === 1) {
+      // lineTo
+      if (!cursor) { i += 2; continue; }
+      const p: Point = [pathArray[i++], pathArray[i++]];
+      current.push(p);
+      cursor = p;
+    } else if (op === 2) {
+      // curveTo (cubic bezier: 6 args)
+      if (!cursor) { i += 6; continue; }
+      const p1: Point = [pathArray[i++], pathArray[i++]];
+      const p2: Point = [pathArray[i++], pathArray[i++]];
+      const p3: Point = [pathArray[i++], pathArray[i++]];
+      current.push(...discretizeBezier(cursor, p1, p2, p3, steps));
+      cursor = p3;
+    } else if (op === 4) {
+      // closePath
+      if (current.length >= 3) subpaths.push([...current]);
+      current = [];
+      cursor = null;
+    } else {
+      // Operador desconhecido — encerra leitura segura
+      break;
     }
   }
 
@@ -176,13 +124,10 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
 
   let current: Point[] = [];
   let cursor: Point | null = null;
-  // subpath support: accumulate multiple subpaths per compound path
-  let subpaths: Point[][] = [];
+  const subpaths: Point[][] = [];
 
   const flushCurrent = () => {
-    if (current.length >= 3) {
-      subpaths.push([...current]);
-    }
+    if (current.length >= 3) subpaths.push([...current]);
     current = [];
     cursor = null;
   };
@@ -193,7 +138,7 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
       const poly = toPolygon(sp);
       if (poly) polys.push(poly);
     }
-    subpaths = [];
+    subpaths.length = 0;
     current = [];
     cursor = null;
   };
@@ -203,77 +148,62 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
     const args = opList.argsArray[i];
 
     switch (fn) {
-      // ── pdfjs ≥ 4 bundles ALL path ops into a single constructPath call ──
+
+      // ── pdfjs ≥ 4: todos os caminhos em um único constructPath ────────────
       case OPS.constructPath: {
-        // args = [fillStrokeOp, [Float32Array]]
-        // The Float32Array contains interleaved sub-op codes + coords.
         const pathData: Float32Array | undefined = args?.[1]?.[0];
         if (pathData instanceof Float32Array) {
-          const decoded = decodeConstructPath(pathData, 16);
-          polys.push(...decoded);
+          polys.push(...decodeConstructPath(pathData, 16));
         }
         break;
       }
 
-      // ── Legacy individual path operators (pdfjs < 4 / simple PDFs) ──────
+      // ── Operadores individuais legacy (pdfjs < 4 / outros exportadores) ──
       case OPS.moveTo: {
-        // moveTo starts a new subpath — flush current but keep subpaths
         flushCurrent();
-        const x = args[0];
-        const y = args[1];
-        cursor = [x, y];
+        cursor = [args[0], args[1]];
         current.push(cursor);
         break;
       }
-
       case OPS.lineTo: {
         if (!cursor) break;
-        const p: Point = [args[0], args[1]];
-        current.push(p);
-        cursor = p;
+        const lp: Point = [args[0], args[1]];
+        current.push(lp);
+        cursor = lp;
         break;
       }
-
       case OPS.curveTo: {
         if (!cursor) break;
-        const p1: Point = [args[0], args[1]];
-        const p2: Point = [args[2], args[3]];
-        const p3: Point = [args[4], args[5]];
-        current.push(...discretizeBezier(cursor, p1, p2, p3, 16));
-        cursor = p3;
+        const cp1: Point = [args[0], args[1]];
+        const cp2: Point = [args[2], args[3]];
+        const cp3: Point = [args[4], args[5]];
+        current.push(...discretizeBezier(cursor, cp1, cp2, cp3, 16));
+        cursor = cp3;
         break;
       }
-
       case OPS.curveTo2: {
         if (!cursor) break;
-        const p1 = cursor;
-        const p2: Point = [args[0], args[1]];
-        const p3: Point = [args[2], args[3]];
-        current.push(...discretizeBezier(cursor, p1, p2, p3, 16));
-        cursor = p3;
+        const c2p1 = cursor;
+        const c2p2: Point = [args[0], args[1]];
+        const c2p3: Point = [args[2], args[3]];
+        current.push(...discretizeBezier(cursor, c2p1, c2p2, c2p3, 16));
+        cursor = c2p3;
         break;
       }
-
       case OPS.curveTo3: {
         if (!cursor) break;
-        const p1: Point = [args[0], args[1]];
-        const p2: Point = [args[2], args[3]];
-        current.push(...discretizeBezier(cursor, p1, p2, p2, 16));
-        cursor = p2;
+        const c3p1: Point = [args[0], args[1]];
+        const c3p2: Point = [args[2], args[3]];
+        current.push(...discretizeBezier(cursor, c3p1, c3p2, c3p2, 16));
+        cursor = c3p2;
         break;
       }
-
       case OPS.closePath: {
-        // close current subpath but don't flush all yet
-        if (current.length >= 3) {
-          subpaths.push([...current]);
-        }
+        if (current.length >= 3) subpaths.push([...current]);
         current = [];
         cursor = null;
         break;
       }
-
-      // fill/stroke operators signal end of a compound path
       case OPS.fill:
       case OPS.eoFill:
       case OPS.fillStroke:
@@ -282,64 +212,73 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
         flushAll();
         break;
       }
-
-      // rectangle operator — very common in CAD exports
       case OPS.rectangle: {
         flushAll();
         const rx = args[0], ry = args[1], rw = args[2], rh = args[3];
         if (Math.abs(rw * rh) * PT_TO_MM * PT_TO_MM >= MIN_AREA_MM2) {
-          const poly: Polygon = [
+          polys.push([
             { x: mm(rx),      y: mm(ry) },
             { x: mm(rx + rw), y: mm(ry) },
             { x: mm(rx + rw), y: mm(ry + rh) },
             { x: mm(rx),      y: mm(ry + rh) },
             { x: mm(rx),      y: mm(ry) },
-          ];
-          polys.push(poly);
+          ]);
         }
         break;
       }
-
       default:
         break;
     }
   }
 
   flushAll();
-
   return polys;
 }
 
+// ─── Determina se `inner` é um furo dentro de `outer` ────────────────────────
+// Verifica múltiplos pontos distribuídos no contorno para maior robustez.
+function isHoleOf(outer: Polygon, inner: Polygon): boolean {
+  if (inner.length === 0) return false;
+  // Testa até 4 pontos espaçados do inner para confirmar contenção
+  const step = Math.max(1, Math.floor(inner.length / 4));
+  for (let k = 0; k < inner.length; k += step) {
+    if (!pointInPolygon(inner[k], outer)) return false;
+  }
+  return true;
+}
+
 function buildParts(polys: Polygon[]): ParsedPart[] {
+  if (polys.length === 0) return [];
+
+  // Ordena por área decrescente: os maiores são outer, os menores podem ser furos
+  const sorted = [...polys].sort((a, b) => polygonArea(b) - polygonArea(a));
+
   const used = new Set<number>();
   const parts: ParsedPart[] = [];
 
-  for (let i = 0; i < polys.length; i++) {
+  for (let i = 0; i < sorted.length; i++) {
     if (used.has(i)) continue;
-
-    const outer = polys[i];
+    const outer = sorted[i];
+    const outerArea = polygonArea(outer);
     const holes: Polygon[] = [];
 
-    for (let j = 0; j < polys.length; j++) {
-      if (i === j || used.has(j)) continue;
-
-      const inner = polys[j];
-
-      if (polygonContains(outer, inner[0])) {
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (used.has(j)) continue;
+      const inner = sorted[j];
+      // Um furo deve ser significativamente menor que o outer
+      if (polygonArea(inner) >= outerArea * 0.95) continue;
+      if (isHoleOf(outer, inner)) {
         holes.push(inner);
         used.add(j);
       }
     }
 
+    used.add(i);
     const normalizedOuter = normalizeToOrigin(outer);
     const normalizedHoles = holes.map(normalizeToOrigin);
-
     const geom = buildGeometry(normalizedOuter, normalizedHoles);
 
-    parts.push({
-      ...geom,
-      id: `part-${parts.length}`,
-    });
+    parts.push({ ...geom, id: `part-${parts.length}` });
   }
 
   return parts;
@@ -347,7 +286,6 @@ function buildParts(polys: Polygon[]): ParsedPart[] {
 
 export async function parsePdf(buffer: ArrayBuffer): Promise<ParsedPart[]> {
   let pdf;
-
   try {
     pdf = await pdfjsLib.getDocument({
       data: buffer,
@@ -355,7 +293,7 @@ export async function parsePdf(buffer: ArrayBuffer): Promise<ParsedPart[]> {
       isEvalSupported: false,
     }).promise;
   } catch {
-    throw new Error("PDF inválido, protegido ou não legível.");
+    throw new Error("PDF inválido, protegido ou corrompido.");
   }
 
   const polys: Polygon[] = [];
@@ -366,17 +304,28 @@ export async function parsePdf(buffer: ArrayBuffer): Promise<ParsedPart[]> {
       const pagePolys = await extractPolygonsFromPage(page);
       polys.push(...pagePolys);
     } catch (e) {
-      console.warn(`Falha ao interpretar página ${pageNum}`, e);
+      console.warn(`Falha ao processar página ${pageNum}:`, e);
     }
   }
 
-  if (!polys.length) {
+  if (polys.length === 0) {
     throw new Error(
-      "Nenhum vetor encontrado. Certifique-se que o PDF foi exportado com vetores (não rasterizado). Formatos aceitos: CAD (DXF→PDF), CorelDRAW, Illustrator, Inkscape.",
+      "Nenhum caminho vetorial encontrado neste PDF.\n" +
+      "Certifique-se de exportar o arquivo com vetores (não rasterizado).\n" +
+      "Formatos compatíveis: CorelDRAW, Illustrator, Inkscape, AutoCAD (DXF→PDF)."
     );
   }
 
-  return buildParts(polys);
+  const parts = buildParts(polys);
+
+  if (parts.length === 0) {
+    throw new Error(
+      `Foram encontrados ${polys.length} caminhos mas nenhuma peça pôde ser formada. ` +
+      "Verifique se os contornos estão fechados no arquivo original."
+    );
+  }
+
+  return parts;
 }
 
 export function groupParts(parts: ParsedPart[]) {
@@ -391,10 +340,8 @@ export function groupParts(parts: ParsedPart[]) {
 
   for (const part of parts) {
     const b = bbox(part.outer);
-    const key = `${Math.round(part.area)}-${Math.round(b.width)}-${Math.round(b.height)}`;
-
+    const key = `${Math.round(part.area)}-${Math.round(b.maxX - b.minX)}-${Math.round(b.maxY - b.minY)}`;
     const found = groups.find((g) => g.key === key);
-
     if (found) {
       found.quantity += 1;
       found.parts.push(part);
@@ -402,8 +349,8 @@ export function groupParts(parts: ParsedPart[]) {
       groups.push({
         key,
         quantity: 1,
-        width: b.width,
-        height: b.height,
+        width: b.maxX - b.minX,
+        height: b.maxY - b.minY,
         area: part.area,
         parts: [part],
       });
