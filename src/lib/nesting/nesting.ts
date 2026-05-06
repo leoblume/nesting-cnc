@@ -33,15 +33,17 @@ export interface PlacedPart {
   polygon: Polygon; // final placed polygon (with margin offset already applied on x/y)
   holes: Polygon[];
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
-  area: number;
+  area: number;       // real polygon area (for reference)
+  bboxArea: number;   // rectangular bounding-box area — what actually gets consumed on the sheet
 }
 
 export interface NestResult {
   sheets: PlacedPart[][];
   unplaced: { partId: string; groupSig: string }[];
-  totalPartArea: number;
-  totalSheetArea: number;
-  utilization: number;
+  totalPartArea: number;      // sum of polygon areas (informational)
+  totalBboxArea: number;      // sum of bbox areas (rectangular occupation)
+  totalSheetArea: number;     // total area of all sheets used
+  utilization: number;        // totalBboxArea / totalSheetArea  — real rectangular utilization
 }
 
 function transformGeom(geom: PartGeometry, rotation: number, mirror: boolean) {
@@ -96,7 +98,10 @@ export function runNesting(parts: ParsedPart[], opts: NestingOptions): NestResul
       placed = tryPlace(part, sheets.length - 1);
     }
     if (!placed) unplaced.push({ partId: part.id, groupSig: part.signature });
-    else totalArea += part.area;
+    else {
+      totalArea += part.area;
+      // bboxArea is added via the placed candidate below — accumulated in sheets
+    }
 
     function tryPlace(part: ParsedPart, sheetIdx: number): boolean {
       const existing = sheets[sheetIdx];
@@ -130,6 +135,8 @@ export function runNesting(parts: ParsedPart[], opts: NestingOptions): NestResul
               }
               if (!collides) {
                 const placedHoles = holes.map((hp) => translatePolygon(hp, x, y));
+                const bboxW = pb.maxX - pb.minX;
+                const bboxH = pb.maxY - pb.minY;
                 const candidate: PlacedPart = {
                   partId: part.id,
                   groupSig: part.signature,
@@ -147,6 +154,7 @@ export function runNesting(parts: ParsedPart[], opts: NestingOptions): NestResul
                     maxY: pb.maxY + opts.margin,
                   },
                   area: part.area,
+                  bboxArea: bboxW * bboxH,
                 };
                 if (!best || candidate.bbox.minY < best.bbox.minY ||
                     (candidate.bbox.minY === best.bbox.minY && candidate.bbox.minX < best.bbox.minX)) {
@@ -168,11 +176,13 @@ export function runNesting(parts: ParsedPart[], opts: NestingOptions): NestResul
   }
 
   const totalSheetArea = sheets.length * opts.sheetWidth * opts.sheetHeight;
+  const totalBboxArea = sheets.flat().reduce((s, p) => s + p.bboxArea, 0);
   return {
     sheets,
     unplaced,
     totalPartArea: totalArea,
+    totalBboxArea,
     totalSheetArea,
-    utilization: totalSheetArea ? totalArea / totalSheetArea : 0,
+    utilization: totalSheetArea ? totalBboxArea / totalSheetArea : 0,
   };
 }

@@ -202,8 +202,14 @@ export default function NestingApp() {
   const stats = useMemo(() => {
     if (!result) return null;
     const placed = result.sheets.reduce((s, sh) => s + sh.length, 0);
-    return { placed, unplaced: result.unplaced.length, models: groups.length, total: parts.length, utilization: result.utilization, sheets: result.sheets.length };
-  }, [result, parts, groups]);
+    const sheetArea = opts.sheetWidth * opts.sheetHeight;
+    const perSheet = result.sheets.map((sh, i) => {
+      const bboxUsed = sh.reduce((s, p) => s + p.bboxArea, 0);
+      const polyUsed = sh.reduce((s, p) => s + p.area, 0);
+      return { index: i + 1, count: sh.length, bboxUtil: sheetArea > 0 ? bboxUsed / sheetArea : 0, polyUtil: sheetArea > 0 ? polyUsed / sheetArea : 0, bboxArea: bboxUsed, polyArea: polyUsed, wasteArea: sheetArea - bboxUsed };
+    });
+    return { placed, unplaced: result.unplaced.length, models: groups.length, total: parts.length, utilization: result.utilization, sheets: result.sheets.length, totalBboxArea: result.totalBboxArea, totalPartArea: result.totalPartArea, totalSheetArea: result.totalSheetArea, sheetArea, perSheet };
+  }, [result, parts, groups, opts.sheetWidth, opts.sheetHeight]);
 
   const ledResult = useMemo(() => groups.length ? calcLeds(groups, ledCfg) : null, [groups, ledCfg]);
 
@@ -303,7 +309,7 @@ export default function NestingApp() {
               <div className="flex justify-between"><span className="text-muted-foreground">Modelos</span><span>{stats.models}</span></div>
               <div className="flex justify-between"><span className="text-muted-foreground">Posicionadas</span><span>{stats.placed}</span></div>
               {stats.unplaced > 0 && <div className="flex justify-between text-destructive"><span>Não posicionadas</span><span>{stats.unplaced}</span></div>}
-              <div className="flex justify-between font-medium"><span className="text-muted-foreground">Aproveitamento</span><span>{(stats.utilization * 100).toFixed(1)}%</span></div>
+              <div className="flex justify-between font-medium"><span className="text-muted-foreground">Aproveit. retangular</span><span className="text-green-400">{(stats.utilization * 100).toFixed(1)}%</span></div>
               <div className="flex justify-between"><span className="text-muted-foreground">Chapas</span><span>{stats.sheets}</span></div>
             </div>
           )}
@@ -371,11 +377,27 @@ export default function NestingApp() {
                   {!stats ? (
                     <p className="text-xs text-muted-foreground">Execute o nesting para gerar o relatório.</p>
                   ) : (
-                    <div className="space-y-1 text-xs">
+                    <div className="space-y-2 text-xs">
                       <div className="flex justify-between"><span className="text-muted-foreground">Chapas usadas</span><span>{stats.sheets}</span></div>
                       <div className="flex justify-between"><span className="text-muted-foreground">Peças posicionadas</span><span>{stats.placed}/{stats.total}</span></div>
-                      <div className="flex justify-between font-semibold"><span className="text-muted-foreground">Aproveitamento médio</span><span>{(stats.utilization * 100).toFixed(1)}%</span></div>
                       {stats.unplaced > 0 && <div className="flex justify-between text-destructive"><span>Sem posição</span><span>{stats.unplaced}</span></div>}
+                      <div className="border-t border-border pt-2 mt-1">
+                        <p className="text-[10px] uppercase tracking-wider text-muted-foreground/60 mb-1">Aproveitamento (retangular)</p>
+                        <div className="flex justify-between font-bold text-green-400"><span className="text-muted-foreground font-normal">Geral</span><span>{(stats.utilization * 100).toFixed(1)}%</span></div>
+                        {stats.perSheet.map((s: any) => (
+                          <div key={s.index} className="flex justify-between text-muted-foreground">
+                            <span>Chapa {s.index} ({s.count} pç)</span>
+                            <span className={s.bboxUtil >= 0.7 ? "text-green-400" : s.bboxUtil >= 0.5 ? "text-yellow-400" : "text-red-400"}>{(s.bboxUtil * 100).toFixed(1)}%</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="border-t border-border pt-2">
+                        <p className="text-[10px] uppercase tracking-wider text-muted-foreground/60 mb-1">Áreas (cm²)</p>
+                        <div className="flex justify-between"><span className="text-muted-foreground">Chapa</span><span>{(stats.sheetArea / 100).toFixed(0)}</span></div>
+                        <div className="flex justify-between"><span className="text-muted-foreground">Ocupada (bbox)</span><span className="text-blue-400">{(stats.totalBboxArea / 100).toFixed(0)}</span></div>
+                        <div className="flex justify-between"><span className="text-muted-foreground">Forma real (polígono)</span><span className="text-muted-foreground/60">{(stats.totalPartArea / 100).toFixed(0)}</span></div>
+                        <div className="flex justify-between"><span className="text-muted-foreground">Sobra estimada</span><span className="text-red-400">{((stats.totalSheetArea - stats.totalBboxArea) / 100).toFixed(0)}</span></div>
+                      </div>
                     </div>
                   )}
                 </div>
