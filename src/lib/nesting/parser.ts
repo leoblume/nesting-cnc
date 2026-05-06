@@ -13,7 +13,8 @@ import {
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const PT_TO_MM = 25.4 / 72;
-const MIN_AREA_MM2 = 4;
+// Área mínima reduzida para capturar peças pequenas
+const MIN_AREA_MM2 = 1;
 
 export interface ParsedPart extends PartGeometry {
   id: string;
@@ -53,18 +54,16 @@ function discretizeBezier(
   p1: Point,
   p2: Point,
   p3: Point,
-  steps = 12,
+  steps = 16,
 ): Point[] {
   const pts: Point[] = [];
-
   for (let i = 1; i <= steps; i++) {
     pts.push(bezierPoint(p0, p1, p2, p3, i / steps));
   }
-
   return pts;
 }
 
-function closeEnough(a: Point, b: Point, eps = 0.01) {
+function closeEnough(a: Point, b: Point, eps = 0.5) {
   return Math.abs(a[0] - b[0]) < eps && Math.abs(a[1] - b[1]) < eps;
 }
 
@@ -90,20 +89,29 @@ function toPolygon(path: Point[]): Polygon | null {
 
 async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
   const opList = await page.getOperatorList();
-
   const OPS = pdfjsLib.OPS;
   const polys: Polygon[] = [];
 
   let current: Point[] = [];
   let cursor: Point | null = null;
+  // subpath support: accumulate multiple subpaths per compound path
+  let subpaths: Point[][] = [];
 
-  const flush = () => {
-    if (!current.length) return;
+  const flushCurrent = () => {
+    if (current.length >= 3) {
+      subpaths.push([...current]);
+    }
+    current = [];
+    cursor = null;
+  };
 
-    const poly = toPolygon(current);
-
-    if (poly) polys.push(poly);
-
+  const flushAll = () => {
+    flushCurrent();
+    for (const sp of subpaths) {
+      const poly = toPolygon(sp);
+      if (poly) polys.push(poly);
+    }
+    subpaths = [];
     current = [];
     cursor = null;
   };
@@ -114,7 +122,8 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
 
     switch (fn) {
       case OPS.moveTo: {
-        flush();
+        // moveTo starts a new subpath — flush current but keep subpaths
+        flushCurrent();
         const x = args[0];
         const y = args[1];
         cursor = [x, y];
@@ -132,47 +141,67 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
 
       case OPS.curveTo: {
         if (!cursor) break;
-
         const p1: Point = [args[0], args[1]];
         const p2: Point = [args[2], args[3]];
         const p3: Point = [args[4], args[5]];
-
-        const curve = discretizeBezier(cursor, p1, p2, p3, 10);
-
-        current.push(...curve);
+        current.push(...discretizeBezier(cursor, p1, p2, p3, 16));
         cursor = p3;
         break;
       }
 
       case OPS.curveTo2: {
         if (!cursor) break;
-
         const p1 = cursor;
         const p2: Point = [args[0], args[1]];
         const p3: Point = [args[2], args[3]];
-
-        const curve = discretizeBezier(cursor, p1, p2, p3, 10);
-
-        current.push(...curve);
+        current.push(...discretizeBezier(cursor, p1, p2, p3, 16));
         cursor = p3;
         break;
       }
 
       case OPS.curveTo3: {
         if (!cursor) break;
-
         const p1: Point = [args[0], args[1]];
         const p2: Point = [args[2], args[3]];
-
-        const curve = discretizeBezier(cursor, p1, p2, p2, 10);
-
-        current.push(...curve);
+        current.push(...discretizeBezier(cursor, p1, p2, p2, 16));
         cursor = p2;
         break;
       }
 
       case OPS.closePath: {
-        flush();
+        // close current subpath but don't flush all yet
+        if (current.length >= 3) {
+          subpaths.push([...current]);
+        }
+        current = [];
+        cursor = null;
+        break;
+      }
+
+      // fill/stroke operators signal end of a compound path
+      case OPS.fill:
+      case OPS.eoFill:
+      case OPS.fillStroke:
+      case OPS.eoFillStroke:
+      case OPS.stroke: {
+        flushAll();
+        break;
+      }
+
+      // rectangle operator — very common in CAD exports
+      case OPS.rectangle: {
+        flushAll();
+        const rx = args[0], ry = args[1], rw = args[2], rh = args[3];
+        if (Math.abs(rw * rh) * PT_TO_MM * PT_TO_MM >= MIN_AREA_MM2) {
+          const poly: Polygon = [
+            { x: mm(rx),      y: mm(ry) },
+            { x: mm(rx + rw), y: mm(ry) },
+            { x: mm(rx + rw), y: mm(ry + rh) },
+            { x: mm(rx),      y: mm(ry + rh) },
+            { x: mm(rx),      y: mm(ry) },
+          ];
+          polys.push(poly);
+        }
         break;
       }
 
@@ -181,7 +210,7 @@ async function extractPolygonsFromPage(page: any): Promise<Polygon[]> {
     }
   }
 
-  flush();
+  flushAll();
 
   return polys;
 }
@@ -238,7 +267,6 @@ export async function parsePdf(buffer: ArrayBuffer): Promise<ParsedPart[]> {
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
-
     try {
       const pagePolys = await extractPolygonsFromPage(page);
       polys.push(...pagePolys);
@@ -249,7 +277,7 @@ export async function parsePdf(buffer: ArrayBuffer): Promise<ParsedPart[]> {
 
   if (!polys.length) {
     throw new Error(
-      "Este PDF não contém vetores interpretáveis. Exporte PDF vetorial de CAD/Corel/Illustrator.",
+      "Nenhum vetor encontrado. Certifique-se que o PDF foi exportado com vetores (não rasterizado). Formatos aceitos: CAD (DXF→PDF), CorelDRAW, Illustrator, Inkscape.",
     );
   }
 
