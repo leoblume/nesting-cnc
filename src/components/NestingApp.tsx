@@ -13,7 +13,7 @@ import {
 import { parsePdf, groupParts, type ParsedPart } from "@/lib/nesting/parser";
 import { runNesting, type NestResult, type PlacedPart, type NestingOptions } from "@/lib/nesting/nesting";
 import { type Point } from "@/lib/nesting/geometry";
-import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw } from "lucide-react";
+import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw, Printer } from "lucide-react";
 
 const PART_COLORS = [
   "#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6",
@@ -668,6 +668,197 @@ function LedDrawingCanvas({
   );
 }
 
+
+// ─── Print Plan ───────────────────────────────────────────────────────────────
+function printPlan(
+  result: NestResult,
+  opts: NestingOptions,
+  ledModel: LedModel | null,
+  showLeds: boolean,
+  borderMargin: number,
+  groups: ReturnType<typeof groupParts>,
+  ledSummary: { rows: any[]; totalLeds: number; totalPower: number } | null,
+  fileName: string,
+) {
+  const win = window.open("", "_blank", "width=1200,height=900");
+  if (!win) { alert("Permita popups para imprimir."); return; }
+
+  // Build all sheet canvases as data-URLs
+  const sheetDataUrls: string[] = [];
+  for (let si = 0; si < result.sheets.length; si++) {
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(900 / opts.sheetWidth, 600 / opts.sheetHeight);
+    const w = opts.sheetWidth * scale;
+    const h = opts.sheetHeight * scale;
+    canvas.width = w; canvas.height = h;
+    renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, ledModel, showLeds, borderMargin);
+    sheetDataUrls.push(canvas.toDataURL("image/png"));
+  }
+
+  // Build LED drawing canvases per group
+  const ledUrls: string[] = [];
+  if (ledModel && groups.length) {
+    for (const g of groups) {
+      const poly = g.parts[0]?.outer ?? [];
+      const holes = g.parts[0]?.holes ?? [];
+      const { totalLeds, pitch } = poly.length
+        ? calcLedsForPart(poly, holes, ledModel, borderMargin)
+        : calcLedsForBbox(g.width, g.height, ledModel, borderMargin);
+
+      const S = Math.min(3, 300 / Math.max(g.width, g.height));
+      const cw = Math.round(g.width * S + 48);
+      const ch = Math.round(g.height * S + 80);
+      const canvas = document.createElement("canvas");
+      canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext("2d")!;
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cw, ch);
+
+      const ox = 24, oy = 24;
+      const pw = g.width * S, ph = g.height * S;
+
+      if (poly.length > 0) {
+        let pminX = Infinity, pminY = Infinity;
+        for (const p of poly) { if (p.x < pminX) pminX = p.x; if (p.y < pminY) pminY = p.y; }
+        const toS = (p: {x:number;y:number}) => ({ x: ox + (p.x - pminX) * S, y: oy + (p.y - pminY) * S });
+
+        ctx.beginPath();
+        const sp0 = toS(poly[0]); ctx.moveTo(sp0.x, sp0.y);
+        for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
+        ctx.closePath();
+        ctx.fillStyle = "#e8f4fd"; ctx.fill();
+        ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5; ctx.stroke();
+
+        for (const hole of holes) {
+          if (!hole.length) continue;
+          ctx.beginPath();
+          const sh0 = toS(hole[0]); ctx.moveTo(sh0.x, sh0.y);
+          for (let i = 1; i < hole.length; i++) { const sh = toS(hole[i]); ctx.lineTo(sh.x, sh.y); }
+          ctx.closePath();
+          ctx.fillStyle = "#fff"; ctx.fill();
+          ctx.strokeStyle = "#93c5fd"; ctx.lineWidth = 1; ctx.stroke();
+        }
+
+        const { positions } = calcLedsForPart(poly, holes, ledModel, borderMargin);
+        const ledW = Math.max(1.5, ledModel.width * S);
+        const ledH = Math.max(1.5, ledModel.height * S);
+        for (const pos of positions) {
+          const lx = ox + (pos.x - pminX) * S;
+          const ly = oy + (pos.y - pminY) * S;
+          ctx.fillStyle = "#facc15"; ctx.strokeStyle = "#d97706"; ctx.lineWidth = 0.5;
+          ctx.fillRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
+          ctx.strokeRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
+        }
+      } else {
+        ctx.fillStyle = "#e8f4fd"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5;
+        ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
+      }
+
+      ctx.fillStyle = "#111"; ctx.font = "bold 10px monospace";
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText(`${g.width.toFixed(0)}×${g.height.toFixed(0)}mm  |  ${totalLeds} LEDs  |  pitch ${pitch.toFixed(1)}mm  |  ×${g.quantity}pç`, cw/2, oy + ph + 6);
+      ledUrls.push(canvas.toDataURL("image/png"));
+    }
+  }
+
+  const now = new Date().toLocaleString("pt-BR");
+  const totalParts = result.sheets.reduce((s, sh) => s + sh.length, 0);
+
+  let html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Plano de Corte – ${fileName}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #fff; color: #111; padding: 24px; }
+  h1 { font-size: 18px; font-weight: 700; border-bottom: 2px solid #111; padding-bottom: 8px; margin-bottom: 4px; }
+  .meta { font-size: 11px; color: #555; margin-bottom: 20px; }
+  .section { margin-bottom: 28px; }
+  .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-bottom: 12px; color: #333; }
+  .sheet-block { page-break-inside: avoid; margin-bottom: 24px; }
+  .sheet-label { font-size: 11px; font-weight: 700; margin-bottom: 6px; }
+  .sheet-img { border: 1px solid #bbb; display: block; max-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { background: #f3f4f6; text-align: right; padding: 5px 8px; border: 1px solid #ddd; font-weight: 700; }
+  th:first-child { text-align: left; }
+  td { padding: 4px 8px; border: 1px solid #eee; text-align: right; }
+  td:first-child { text-align: left; }
+  tr:nth-child(even) td { background: #f9fafb; }
+  .total-row td { font-weight: 700; background: #f3f4f6 !important; border-top: 2px solid #bbb; }
+  .led-grid { display: flex; flex-wrap: wrap; gap: 16px; }
+  .led-card { border: 1px solid #ddd; padding: 8px; page-break-inside: avoid; }
+  .led-img { display: block; border: 1px solid #eee; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat-box { border: 1px solid #ddd; padding: 10px; }
+  .stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
+  .stat-val { font-size: 20px; font-weight: 700; }
+  @media print {
+    body { padding: 12px; }
+    .no-print { display: none; }
+    @page { margin: 1cm; size: A4 landscape; }
+  }
+</style></head><body>`;
+
+  html += `<h1>📐 Plano de Corte e LED</h1>
+<div class="meta">Arquivo: <b>${fileName}</b> &nbsp;|&nbsp; Gerado: ${now} &nbsp;|&nbsp; Chapa: ${opts.sheetWidth}×${opts.sheetHeight}mm &nbsp;|&nbsp; Folga: ${opts.gap}mm &nbsp;|&nbsp; Margem: ${opts.margin}mm</div>`;
+
+  // Summary stats
+  html += `<div class="section"><div class="section-title">Resumo</div>
+<div class="stats-grid">
+  <div class="stat-box"><div class="stat-label">Chapas usadas</div><div class="stat-val">${result.sheets.length}</div></div>
+  <div class="stat-box"><div class="stat-label">Peças posicionadas</div><div class="stat-val">${totalParts}</div></div>
+  <div class="stat-box"><div class="stat-label">Aproveitamento</div><div class="stat-val">${(result.utilization * 100).toFixed(1)}%</div></div>
+</div>`;
+
+  if (ledSummary && ledModel) {
+    html += `<div class="stats-grid">
+  <div class="stat-box"><div class="stat-label">Total de LEDs</div><div class="stat-val">${ledSummary.totalLeds.toLocaleString("pt-BR")}</div></div>
+  <div class="stat-box"><div class="stat-label">Potência total</div><div class="stat-val">${ledSummary.totalPower.toFixed(1)} W</div></div>
+  <div class="stat-box"><div class="stat-label">LED: ${ledModel.name}</div><div class="stat-val">${ledModel.width}×${ledModel.height}mm</div></div>
+</div>`;
+  }
+  html += `</div>`;
+
+  // Sheets
+  html += `<div class="section"><div class="section-title">Chapas de Corte</div>`;
+  for (let si = 0; si < result.sheets.length; si++) {
+    const sh = result.sheets[si];
+    html += `<div class="sheet-block">
+<div class="sheet-label">Chapa ${si + 1} — ${sh.length} peça(s)</div>
+<img class="sheet-img" src="${sheetDataUrls[si]}" />
+</div>`;
+  }
+  html += `</div>`;
+
+  // LED drawing per model
+  if (ledModel && ledUrls.length) {
+    html += `<div class="section"><div class="section-title">Plano de Posicionamento LED — ${ledModel.name} (${ledModel.width}×${ledModel.height}mm, margem ${borderMargin}mm)</div>
+<div class="led-grid">`;
+    groups.forEach((g, gi) => {
+      html += `<div class="led-card"><img class="led-img" src="${ledUrls[gi]}" /></div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // LED detail table
+  if (ledSummary) {
+    html += `<div class="section"><div class="section-title">Detalhamento de LEDs por Modelo</div>
+<table><thead><tr>
+<th>Dimensões (mm)</th><th>Qtd</th><th>Pitch (mm)</th><th>LEDs/peça</th><th>Total LEDs</th><th>Potência (W)</th>
+</tr></thead><tbody>`;
+    for (const row of ledSummary.rows) {
+      html += `<tr><td>${row.width.toFixed(0)} × ${row.height.toFixed(0)}</td><td>${row.qty}</td><td>${row.pitch.toFixed(1)}</td><td>${row.ledsPerPiece}</td><td>${row.totalLeds}</td><td>${row.totalPower.toFixed(1)}</td></tr>`;
+    }
+    html += `</tbody><tfoot><tr class="total-row"><td colspan="4">TOTAL</td><td>${ledSummary.totalLeds.toLocaleString("pt-BR")}</td><td>${ledSummary.totalPower.toFixed(1)}</td></tr></tfoot></table></div>`;
+  }
+
+  html += `<div class="no-print" style="position:fixed;top:16px;right:16px;">
+<button onclick="window.print()" style="background:#111;color:#fff;border:none;padding:10px 20px;font-size:14px;cursor:pointer;font-family:monospace;">🖨️ Imprimir</button>
+</div>`;
+  html += `</body></html>`;
+
+  win.document.write(html);
+  win.document.close();
+  setTimeout(() => win.print(), 800);
+}
+
 // ─── Main App ──────────────────────────────────────────────────────────────
 export default function NestingApp() {
   const [fileName, setFileName] = useState("");
@@ -682,9 +873,16 @@ export default function NestingApp() {
   const [activeTab, setActiveTab] = useState<"nesting" | "leds" | "ledcad">("nesting");
   const [opts, setOpts] = useState<NestingOptions>({ sheetWidth: 2750, sheetHeight: 1830, gap: 5, margin: 10, allowRotation: true, allowMirror: false, priority: "yield" });
 
-  // LED state
-  const [ledModels, setLedModels] = useState<LedModel[]>([]);
-  const [selectedLedId, setSelectedLedId] = useState<string | null>(null);
+  // LED state — persisted in localStorage
+  const [ledModels, setLedModels] = useState<LedModel[]>(() => {
+    try {
+      const saved = localStorage.getItem("nestcnc_led_models");
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+  const [selectedLedId, setSelectedLedId] = useState<string | null>(() => {
+    try { return localStorage.getItem("nestcnc_led_selected"); } catch { return null; }
+  });
   const [showLeds, setShowLeds] = useState(true);
   const [borderMargin, setBorderMargin] = useState(4);
   // Track the LED model that was last used to render — to show "update" button
@@ -741,6 +939,18 @@ export default function NestingApp() {
     setNesting(true);
     try { const r = runNesting(parts, opts); setResult(r); setActiveSheet(0); } finally { setNesting(false); }
   }, [parts, opts]);
+
+  // Persist LED models whenever they change
+  useEffect(() => {
+    try { localStorage.setItem("nestcnc_led_models", JSON.stringify(ledModels)); } catch {}
+  }, [ledModels]);
+
+  useEffect(() => {
+    try {
+      if (selectedLedId) localStorage.setItem("nestcnc_led_selected", selectedLedId);
+      else localStorage.removeItem("nestcnc_led_selected");
+    } catch {}
+  }, [selectedLedId]);
 
   const redraw = useCallback(() => {
     if (!result || !canvasRef.current || !containerRef.current) return;
@@ -896,6 +1106,16 @@ export default function NestingApp() {
           <Button onClick={onNest} disabled={!parts.length || nesting} className="w-full">
             {nesting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />} Calcular Nesting
           </Button>
+
+          {result && (
+            <Button
+              variant="outline"
+              className="w-full border-slate-600 text-slate-300 hover:bg-slate-800 hover:text-white"
+              onClick={() => printPlan(result, opts, selectedLed, showLeds, borderMargin, groups, ledSummary, fileName || "sem-nome.pdf")}
+            >
+              <Printer className="mr-2 h-4 w-4" /> Imprimir Plano de Corte
+            </Button>
+          )}
 
           {/* LED overlay toggle */}
           {result && ledModels.length > 0 && (

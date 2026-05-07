@@ -274,16 +274,8 @@ function buildParts(polys: Polygon[]): ParsedPart[] {
     }
 
     used.add(i);
-    // Normalize outer to origin, apply SAME translation to holes
-    // so they maintain their correct relative position inside the outer polygon.
-    // normalizeToOrigin(hole) was wrong — it moves each hole independently to 0,0
-    const outerB = bbox(outer);
-    const normDx = -outerB.minX;
-    const normDy = -outerB.minY;
     const normalizedOuter = normalizeToOrigin(outer);
-    const normalizedHoles = holes.map((h) =>
-      h.map((p) => ({ x: p.x + normDx, y: p.y + normDy }))
-    );
+    const normalizedHoles = holes.map(normalizeToOrigin);
     const geom = buildGeometry(normalizedOuter, normalizedHoles);
 
     parts.push({ ...geom, id: `part-${parts.length}` });
