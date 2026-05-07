@@ -12,7 +12,8 @@ import {
 } from "@/components/ui/select";
 import { parsePdf, groupParts, type ParsedPart } from "@/lib/nesting/parser";
 import { runNesting, type NestResult, type PlacedPart, type NestingOptions } from "@/lib/nesting/nesting";
-import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package } from "lucide-react";
+import { type Point } from "@/lib/nesting/geometry";
+import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw } from "lucide-react";
 
 const PART_COLORS = [
   "#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6",
@@ -36,54 +37,118 @@ export interface LedModel {
   photoUrl?: string;
 }
 
-// ─── LED Calculation ───────────────────────────────────────────────────────
-// Rule: letter area needs 4mm border margin
-// LED pitch: distance between LEDs < (letter_thickness - 10%)
-// letter_thickness = min(width, height) - 8mm (subtracting 2*4mm border)
-// pitch = (thickness * 0.9) which is < (thickness - 10%)
+// ─── Point-in-polygon test ─────────────────────────────────────────────────
+function pointInPoly(pt: Point, poly: Point[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    if (yi > pt.y !== yj > pt.y && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// ─── LED Calculation (shape-aware) ────────────────────────────────────────
+// Instead of using bbox, we use the actual polygon to filter LED positions.
+// - Generate a grid over the bounding box with pitch spacing
+// - Keep only positions that are INSIDE the outer polygon AND NOT inside any hole
+// - Respect border margin by shrinking the polygon inward (approximate)
+
+function shrinkPolygon(poly: Point[], margin: number): Point[] {
+  // Approximate inward shrink: move each vertex toward centroid by margin
+  let cx = 0, cy = 0;
+  for (const p of poly) { cx += p.x; cy += p.y; }
+  cx /= poly.length; cy /= poly.length;
+  return poly.map((p) => {
+    const dx = cx - p.x, dy = cy - p.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const ratio = Math.min(1, margin / len);
+    return { x: p.x + dx * ratio, y: p.y + dy * ratio };
+  });
+}
 
 function calcLedsForPart(
+  polygon: Point[],
+  holes: Point[][],
+  ledModel: LedModel,
+  borderMargin = 4
+): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }> } {
+  if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [] };
+
+  // Bounding box of outer polygon
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of polygon) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+
+  // Thickness = minimum dimension minus border margins
+  const innerW = bboxW - 2 * borderMargin;
+  const innerH = bboxH - 2 * borderMargin;
+  if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
+
+  const thickness = Math.min(innerW, innerH);
+  const maxPitch = thickness * 0.9;
+  const ledRef = Math.max(ledModel.width, ledModel.height);
+  const pitch = Math.min(ledRef, maxPitch);
+  if (pitch <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
+
+  // Shrink polygon inward by borderMargin to get valid placement area
+  const inner = shrinkPolygon(polygon, borderMargin);
+
+  // Grid scan: place LED centers on pitch grid, filtered by shape
+  const positions: Array<{ x: number; y: number }> = [];
+
+  const cols = Math.max(1, Math.floor(bboxW / pitch));
+  const rows = Math.max(1, Math.floor(bboxH / pitch));
+  const offsetX = (bboxW - cols * pitch) / 2;
+  const offsetY = (bboxH - rows * pitch) / 2;
+
+  for (let row = 0; row <= rows; row++) {
+    for (let col = 0; col <= cols; col++) {
+      const x = minX + offsetX + col * pitch;
+      const y = minY + offsetY + row * pitch;
+      const pt = { x, y };
+
+      // Must be inside the (shrunk) outer polygon
+      if (!pointInPoly(pt, inner)) continue;
+
+      // Must NOT be inside any hole
+      let inHole = false;
+      for (const hole of holes) {
+        if (pointInPoly(pt, hole)) { inHole = true; break; }
+      }
+      if (inHole) continue;
+
+      positions.push({ x, y });
+    }
+  }
+
+  return { totalLeds: positions.length, pitch, positions };
+}
+
+// Legacy bbox-based calc for the summary table (quick approximation)
+function calcLedsForBbox(
   partWidth: number,
   partHeight: number,
   ledModel: LedModel,
   borderMargin = 4
-): { ledsX: number; ledsY: number; totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }> } {
+): { ledsX: number; ledsY: number; totalLeds: number; pitch: number } {
   const innerW = partWidth - 2 * borderMargin;
   const innerH = partHeight - 2 * borderMargin;
-
-  if (innerW <= 0 || innerH <= 0) {
-    return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, positions: [] };
-  }
-
-  // Thickness = minimum inner dimension (espessura da letra)
+  if (innerW <= 0 || innerH <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
   const thickness = Math.min(innerW, innerH);
-  // Pitch must be < (thickness - 10%) = thickness * 0.9
   const maxPitch = thickness * 0.9;
-  // Use LED max dimension as reference
   const ledRef = Math.max(ledModel.width, ledModel.height);
-  // Pitch = ledRef if ledRef < maxPitch, otherwise use maxPitch
   const pitch = Math.min(ledRef, maxPitch);
-
-  if (pitch <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, positions: [] };
-
+  if (pitch <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
   const ledsX = Math.max(1, Math.floor(innerW / pitch) + 1);
   const ledsY = Math.max(1, Math.floor(innerH / pitch) + 1);
-  const totalLeds = ledsX * ledsY;
-
-  // Generate positions (relative to part origin, with border margin)
-  const positions: Array<{ x: number; y: number }> = [];
-  const stepX = ledsX > 1 ? innerW / (ledsX - 1) : 0;
-  const stepY = ledsY > 1 ? innerH / (ledsY - 1) : 0;
-  for (let yi = 0; yi < ledsY; yi++) {
-    for (let xi = 0; xi < ledsX; xi++) {
-      positions.push({
-        x: borderMargin + xi * stepX,
-        y: borderMargin + yi * stepY,
-      });
-    }
-  }
-
-  return { ledsX, ledsY, totalLeds, pitch, positions };
+  return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch };
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────
@@ -95,6 +160,7 @@ function renderSheet(
   margin: number,
   ledModel: LedModel | null,
   showLeds: boolean,
+  borderMargin: number,
 ) {
   const dpr = window.devicePixelRatio || 1;
   const container = canvas.parentElement!;
@@ -128,7 +194,6 @@ function renderSheet(
   const sigColorMap = new Map<string, string>();
   let idx = 0;
 
-  // Track rightmost/bottommost extent for leftover calc
   let maxX = margin, maxY = margin;
   for (const part of placed) {
     if (part.bbox.maxX > maxX) maxX = part.bbox.maxX;
@@ -177,23 +242,24 @@ function renderSheet(
       ctx.fillText(part.mirrored ? `M${part.rotation}°` : `${part.rotation}°`, cx, cy);
     }
 
-    // Draw LEDs if a model is selected
+    // Draw LEDs following actual polygon shape
     if (showLeds && ledModel) {
-      const partW = part.bbox.maxX - part.bbox.minX;
-      const partH = part.bbox.maxY - part.bbox.minY;
-      const { positions, totalLeds } = calcLedsForPart(partW, partH, ledModel);
+      const { positions, totalLeds } = calcLedsForPart(part.polygon, part.holes, ledModel, borderMargin);
+
+      // LED physical size in screen pixels
+      const ledW = Math.max(2, ledModel.width * scale);
+      const ledH = Math.max(2, ledModel.height * scale);
 
       for (const pos of positions) {
-        const lx = (part.bbox.minX + pos.x) * scale;
-        const ly = (part.bbox.minY + pos.y) * scale;
-        const r = Math.max(1.5, Math.min(3, scale * 0.8));
-        ctx.beginPath();
-        ctx.arc(lx, ly, r, 0, Math.PI * 2);
+        const lx = pos.x * scale;
+        const ly = pos.y * scale;
+
+        // Draw LED as a rectangle at its real size
         ctx.fillStyle = "#fde68a";
-        ctx.fill();
         ctx.strokeStyle = "#f59e0b";
         ctx.lineWidth = 0.5;
-        ctx.stroke();
+        ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+        ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
       }
 
       // Draw LED count below the part
@@ -208,11 +274,10 @@ function renderSheet(
     }
   }
 
-  // Draw leftover area annotation
+  // Leftover area
   if (placed.length > 0) {
     const leftoverW = sheetWidth - maxX - margin;
     const leftoverH = sheetHeight - 2 * margin;
-
     if (leftoverW > 10) {
       ctx.fillStyle = "rgba(16,185,129,0.08)";
       ctx.fillRect(maxX * scale, margin * scale, leftoverW * scale, leftoverH * scale);
@@ -221,7 +286,6 @@ function renderSheet(
       ctx.setLineDash([3, 3]);
       ctx.strokeRect(maxX * scale, margin * scale, leftoverW * scale, leftoverH * scale);
       ctx.setLineDash([]);
-
       const lx = (maxX + leftoverW / 2) * scale;
       const ly = (margin + leftoverH / 2) * scale;
       ctx.font = "bold 9px monospace";
@@ -390,7 +454,7 @@ function LedRegistrationPanel({
   );
 }
 
-// ─── LED Visualization Canvas ─────────────────────────────────────────────
+// ─── LED Visualization Canvas (shape-aware) ───────────────────────────────
 function LedDrawingCanvas({
   groups,
   ledModel,
@@ -411,8 +475,8 @@ function LedDrawingCanvas({
     const ROWS = Math.ceil(groups.length / COLS);
     const CELL_PAD = 24;
     const LABEL_TOP = 16;
-    const LABEL_BOTTOM = 32;
-    const MAX_PART = 130;
+    const LABEL_BOTTOM = 40;
+    const MAX_PART = 150;
 
     const maxW = Math.max(...groups.map((g) => g.width));
     const maxH = Math.max(...groups.map((g) => g.height));
@@ -446,70 +510,154 @@ function LedDrawingCanvas({
       const ox = col * cellW + CELL_PAD + (cellW - 2 * CELL_PAD - pw) / 2;
       const oy = row * cellH + CELL_PAD + LABEL_TOP;
 
-      // Part rectangle
-      ctx.fillStyle = "#1e3a5f";
-      ctx.strokeStyle = "#3b82f6";
-      ctx.lineWidth = 1.5;
-      ctx.fillRect(ox, oy, pw, ph);
-      ctx.strokeRect(ox, oy, pw, ph);
+      // Draw the actual polygon if available, else rectangle
+      const poly = g.parts[0]?.outer ?? null;
+      const holes = g.parts[0]?.holes ?? [];
 
-      // Border margin indicator
-      const bm = borderMargin * s;
-      if (bm > 0 && pw > bm * 2 && ph > bm * 2) {
+      if (poly && poly.length > 0) {
+        // Find polygon bounding box for normalization
+        let pminX = Infinity, pminY = Infinity, pmaxX = -Infinity, pmaxY = -Infinity;
+        for (const p of poly) {
+          if (p.x < pminX) pminX = p.x; if (p.x > pmaxX) pmaxX = p.x;
+          if (p.y < pminY) pminY = p.y; if (p.y > pmaxY) pmaxY = p.y;
+        }
+
+        const toScreen = (p: Point) => ({
+          x: ox + (p.x - pminX) * s,
+          y: oy + (p.y - pminY) * s,
+        });
+
+        // Draw outer polygon
+        ctx.beginPath();
+        const sp0 = toScreen(poly[0]);
+        ctx.moveTo(sp0.x, sp0.y);
+        for (let i = 1; i < poly.length; i++) {
+          const sp = toScreen(poly[i]);
+          ctx.lineTo(sp.x, sp.y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = "#1e3a5f";
+        ctx.fill();
+        ctx.strokeStyle = "#3b82f6";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Draw holes (miolos)
+        for (const hole of holes) {
+          if (!hole.length) continue;
+          ctx.beginPath();
+          const sh0 = toScreen(hole[0]);
+          ctx.moveTo(sh0.x, sh0.y);
+          for (let i = 1; i < hole.length; i++) {
+            const sh = toScreen(hole[i]);
+            ctx.lineTo(sh.x, sh.y);
+          }
+          ctx.closePath();
+          ctx.fillStyle = "#0f172a";
+          ctx.fill();
+          ctx.strokeStyle = "#60a5fa88";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+
+        // Border margin visual indicator (shrunk polygon)
+        const shrunk = shrinkPolygon(poly, borderMargin);
+        ctx.beginPath();
+        const sshr0 = toScreen(shrunk[0]);
+        ctx.moveTo(sshr0.x, sshr0.y);
+        for (let i = 1; i < shrunk.length; i++) {
+          const ssp = toScreen(shrunk[i]);
+          ctx.lineTo(ssp.x, ssp.y);
+        }
+        ctx.closePath();
         ctx.strokeStyle = "#60a5fa55";
         ctx.lineWidth = 0.5;
         ctx.setLineDash([2, 2]);
-        ctx.strokeRect(ox + bm, oy + bm, pw - 2 * bm, ph - 2 * bm);
+        ctx.stroke();
         ctx.setLineDash([]);
-      }
 
-      // LEDs
-      const { positions, totalLeds, pitch } = calcLedsForPart(g.width, g.height, ledModel, borderMargin);
-      for (const pos of positions) {
-        const lx = ox + pos.x * s;
-        const ly = oy + pos.y * s;
-        const r = Math.max(1.5, Math.min(4, s * 1.5));
-        // Glow effect
-        const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, r * 3);
-        grd.addColorStop(0, "#fde68aaa");
-        grd.addColorStop(1, "#f59e0b00");
-        ctx.beginPath();
-        ctx.arc(lx, ly, r * 3, 0, Math.PI * 2);
-        ctx.fillStyle = grd;
-        ctx.fill();
-        // LED dot
-        ctx.beginPath();
-        ctx.arc(lx, ly, r, 0, Math.PI * 2);
+        // Shape-aware LED positions
+        const { positions, totalLeds, pitch } = calcLedsForPart(poly, holes, ledModel, borderMargin);
+
+        // LED physical size in screen pixels
+        const ledW = Math.max(1.5, ledModel.width * s);
+        const ledH = Math.max(1.5, ledModel.height * s);
+
+        for (const pos of positions) {
+          const lx = ox + (pos.x - pminX) * s;
+          const ly = oy + (pos.y - pminY) * s;
+
+          // Glow
+          const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(ledW, ledH));
+          grd.addColorStop(0, "#fde68aaa");
+          grd.addColorStop(1, "#f59e0b00");
+          ctx.beginPath();
+          ctx.arc(lx, ly, Math.max(ledW, ledH), 0, Math.PI * 2);
+          ctx.fillStyle = grd;
+          ctx.fill();
+
+          // LED rectangle at real size
+          ctx.fillStyle = "#fde68a";
+          ctx.strokeStyle = "#f59e0b";
+          ctx.lineWidth = 0.5;
+          ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+          ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+        }
+
+        // Dimensions above
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
+
+        // LED count below
         ctx.fillStyle = "#fde68a";
+        ctx.font = "bold 9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillText(`${totalLeds} LEDs · pitch ${pitch.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+
+        const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin);
+        const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
+        ctx.fillStyle = "#10b981";
+        ctx.font = "8px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 20);
+
+        // Qty badge
+        const badgeW = 24, badgeH = 14;
+        ctx.fillStyle = "#1e40af";
+        ctx.beginPath();
+        ctx.roundRect(ox + pw - badgeW - 2, oy + 2, badgeW, badgeH, 3);
         ctx.fill();
+        ctx.fillStyle = "#93c5fd";
+        ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`×${g.quantity}`, ox + pw - badgeW / 2 - 2, oy + 2 + badgeH / 2);
+
+      } else {
+        // Fallback: draw rectangle
+        ctx.fillStyle = "#1e3a5f";
+        ctx.strokeStyle = "#3b82f6";
+        ctx.lineWidth = 1.5;
+        ctx.fillRect(ox, oy, pw, ph);
+        ctx.strokeRect(ox, oy, pw, ph);
+
+        const { totalLeds, pitch } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin);
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
+        ctx.fillStyle = "#fde68a";
+        ctx.font = "bold 9px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillText(`${totalLeds} LEDs · pitch ${pitch.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
       }
-
-      // Dimensions label above
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "9px monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "bottom";
-      ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
-
-      // LED count label below
-      ctx.fillStyle = "#fde68a";
-      ctx.font = "bold 9px monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      ctx.fillText(`${totalLeds} LEDs · pitch ${pitch.toFixed(1)} mm`, ox + pw / 2, oy + ph + 6);
-
-      // Qty badge (top-right corner of part)
-      const badgeW = 24;
-      const badgeH = 14;
-      ctx.fillStyle = "#1e40af";
-      ctx.beginPath();
-      ctx.roundRect(ox + pw - badgeW - 2, oy + 2, badgeW, badgeH, 3);
-      ctx.fill();
-      ctx.fillStyle = "#93c5fd";
-      ctx.font = "bold 8px monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(`×${g.quantity}`, ox + pw - badgeW / 2 - 2, oy + 2 + badgeH / 2);
     });
   }, [groups, ledModel, borderMargin]);
 
@@ -539,12 +687,34 @@ export default function NestingApp() {
   const [selectedLedId, setSelectedLedId] = useState<string | null>(null);
   const [showLeds, setShowLeds] = useState(true);
   const [borderMargin, setBorderMargin] = useState(4);
+  // Track the LED model that was last used to render — to show "update" button
+  const [renderedLedId, setRenderedLedId] = useState<string | null>(null);
+  const [renderedMargin, setRenderedMargin] = useState<number>(4);
+  const [ledKey, setLedKey] = useState(0); // force canvas re-render
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const setOpt = <K extends keyof NestingOptions>(key: K, val: NestingOptions[K]) => setOpts((p) => ({ ...p, [key]: val }));
 
   const selectedLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
+
+  // Detect if LED selection or margin changed since last render
+  const ledNeedsUpdate = selectedLedId !== renderedLedId || borderMargin !== renderedMargin;
+
+  const handleUpdateLed = useCallback(() => {
+    setLedKey((k) => k + 1);
+    setRenderedLedId(selectedLedId);
+    setRenderedMargin(borderMargin);
+  }, [selectedLedId, borderMargin]);
+
+  // Auto-apply on first selection
+  useEffect(() => {
+    if (selectedLedId && renderedLedId === null) {
+      setRenderedLedId(selectedLedId);
+      setRenderedMargin(borderMargin);
+      setLedKey((k) => k + 1);
+    }
+  }, [selectedLedId]);
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
@@ -574,8 +744,13 @@ export default function NestingApp() {
 
   const redraw = useCallback(() => {
     if (!result || !canvasRef.current || !containerRef.current) return;
-    renderSheet(canvasRef.current, result.sheets[activeSheet] ?? [], opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds);
-  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds]);
+    renderSheet(
+      canvasRef.current,
+      result.sheets[activeSheet] ?? [],
+      opts.sheetWidth, opts.sheetHeight, opts.margin,
+      selectedLed, showLeds, borderMargin
+    );
+  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, borderMargin]);
 
   useEffect(() => { redraw(); }, [redraw]);
 
@@ -602,18 +777,23 @@ export default function NestingApp() {
     return { placed, unplaced: result.unplaced.length, models: groups.length, total: parts.length, utilization: result.utilization, sheets: result.sheets.length, totalBboxArea: result.totalBboxArea, totalPartArea: result.totalPartArea, totalSheetArea: result.totalSheetArea, sheetArea, perSheet };
   }, [result, parts, groups, opts.sheetWidth, opts.sheetHeight, opts.margin]);
 
-  // LED summary
+  // LED summary using shape-aware calc when polygon data is available
   const ledSummary = useMemo(() => {
     if (!groups.length || !selectedLed) return null;
     const rows = groups.map((g) => {
-      const { totalLeds, ledsX, ledsY, pitch } = calcLedsForPart(g.width, g.height, selectedLed, borderMargin);
+      const poly = g.parts[0]?.outer ?? [];
+      const holes = g.parts[0]?.holes ?? [];
+      const { totalLeds, pitch } = poly.length
+        ? calcLedsForPart(poly, holes, selectedLed, borderMargin)
+        : { ...calcLedsForBbox(g.width, g.height, selectedLed, borderMargin), positions: [] };
+      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, selectedLed, borderMargin);
       const totalPower = totalLeds * selectedLed.power * g.quantity;
       return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, totalPower };
     });
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, selectedLed, borderMargin]);
+  }, [groups, selectedLed, borderMargin, ledKey]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
@@ -623,6 +803,9 @@ export default function NestingApp() {
   }, [result, groups]);
 
   const currentSheetParts = result?.sheets[activeSheet] ?? [];
+
+  // Active LED for display (the one currently rendered, not just selected)
+  const activeLedForDisplay = ledModels.find((l) => l.id === renderedLedId) ?? null;
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -717,16 +900,27 @@ export default function NestingApp() {
                 <Switch checked={showLeds} onCheckedChange={setShowLeds} />
               </div>
               {showLeds && (
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">Modelo ativo</Label>
-                  <Select value={selectedLedId ?? ""} onValueChange={setSelectedLedId}>
-                    <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
-                    <SelectContent>
-                      {ledModels.map((l) => (
-                        <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">Modelo ativo</Label>
+                    <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); }}>
+                      <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
+                      <SelectContent>
+                        {ledModels.map((l) => (
+                          <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {ledNeedsUpdate && selectedLedId && (
+                    <Button
+                      onClick={handleUpdateLed}
+                      variant="outline"
+                      className="w-full h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5 mr-1" /> Atualizar LED
+                    </Button>
+                  )}
                 </div>
               )}
             </section>
@@ -821,7 +1015,6 @@ export default function NestingApp() {
                           </div>
                         ))}
                       </div>
-                      {/* ── Leftover dimensions ── */}
                       <div className="border-t border-border pt-2">
                         <p className="text-[10px] uppercase tracking-wider text-muted-foreground/60 mb-1">Sobra útil por chapa</p>
                         {stats.perSheet.map((s: any) => (
@@ -856,7 +1049,7 @@ export default function NestingApp() {
                 </div>
                 <div>
                   <h2 className="text-sm font-semibold">Calculadora de LEDs</h2>
-                  <p className="text-xs text-muted-foreground">Posicionamento automático com base na espessura da letra</p>
+                  <p className="text-xs text-muted-foreground">Posicionamento automático respeitando a forma real da peça</p>
                 </div>
               </div>
 
@@ -876,14 +1069,27 @@ export default function NestingApp() {
                   {ledModels.length === 0 ? (
                     <p className="text-xs text-muted-foreground italic">Cadastre um LED na aba "Cadastro LED"</p>
                   ) : (
-                    <Select value={selectedLedId ?? ""} onValueChange={setSelectedLedId}>
-                      <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
-                      <SelectContent>
-                        {ledModels.map((l) => (
-                          <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    <div className="flex flex-col gap-2">
+                      <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); }}>
+                        <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
+                        <SelectContent>
+                          {ledModels.map((l) => (
+                            <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {/* Update button — shown when LED changed but canvas not yet refreshed */}
+                      {ledNeedsUpdate && selectedLedId && (
+                        <Button
+                          onClick={handleUpdateLed}
+                          variant="outline"
+                          className="w-full h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                          Atualizar visualização do LED
+                        </Button>
+                      )}
+                    </div>
                   )}
                 </div>
                 {selectedLed && (
@@ -892,7 +1098,8 @@ export default function NestingApp() {
                       <span className="text-blue-400">espessura</span> = min(largura, altura) − 2 × {borderMargin}mm<br />
                       <span className="text-yellow-400">pitch_máx</span> = espessura × 0,9 {"<"} (espessura − 10%)<br />
                       <span className="text-green-400">LED_ref</span> = max({selectedLed.width}, {selectedLed.height}) = {Math.max(selectedLed.width, selectedLed.height)} mm<br />
-                      <span className="text-orange-400">pitch_final</span> = min(LED_ref, pitch_máx)
+                      <span className="text-orange-400">pitch_final</span> = min(LED_ref, pitch_máx)<br />
+                      <span className="text-purple-400">posições</span> = filtradas pela forma real do polígono
                     </p>
                   </div>
                 )}
@@ -917,6 +1124,7 @@ export default function NestingApp() {
                       <div className="rounded-lg border border-border bg-card p-4">
                         <p className="text-xs text-muted-foreground mb-1">Total de LEDs</p>
                         <p className="text-2xl font-bold text-yellow-400">{ledSummary.totalLeds.toLocaleString("pt-BR")}</p>
+                        <p className="text-[10px] text-muted-foreground mt-1">contagem por forma real</p>
                       </div>
                       <div className="rounded-lg border border-border bg-card p-4">
                         <p className="text-xs text-muted-foreground mb-1">Potência total</p>
@@ -930,13 +1138,20 @@ export default function NestingApp() {
                   )}
 
                   <div>
-                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
-                      <Zap className="h-3.5 w-3.5 text-yellow-400" /> Desenho de Posicionamento para Produção
-                    </h3>
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
+                        <Zap className="h-3.5 w-3.5 text-yellow-400" /> Desenho de Posicionamento para Produção
+                      </h3>
+                      {ledNeedsUpdate && (
+                        <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-7 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
+                          <RefreshCw className="h-3 w-3 mr-1" /> Atualizar
+                        </Button>
+                      )}
+                    </div>
                     <p className="text-xs text-muted-foreground mb-3">
-                      Pontos amarelos = LEDs · linha pontilhada azul = margem de {borderMargin}mm · badge azul = quantidade de peças
+                      Retângulos amarelos = LEDs em tamanho real · linha pontilhada = margem de {borderMargin}mm · posições filtradas pela forma da peça
                     </p>
-                    <LedDrawingCanvas groups={groups} ledModel={selectedLed} borderMargin={borderMargin} />
+                    <LedDrawingCanvas key={ledKey} groups={groups} ledModel={activeLedForDisplay ?? selectedLed} borderMargin={borderMargin} />
                   </div>
 
                   {ledSummary && (
@@ -951,7 +1166,6 @@ export default function NestingApp() {
                               <th className="px-4 py-2 text-left font-medium text-muted-foreground">Dimensões (mm)</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Qtd</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Pitch (mm)</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">Grid L×A</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">LEDs/peça</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Total LEDs</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Potência (W)</th>
@@ -963,7 +1177,6 @@ export default function NestingApp() {
                                 <td className="px-4 py-2 font-mono">{row.width.toFixed(0)} × {row.height.toFixed(0)}</td>
                                 <td className="px-4 py-2 text-right">{row.qty}</td>
                                 <td className="px-4 py-2 text-right text-blue-400">{row.pitch.toFixed(1)}</td>
-                                <td className="px-4 py-2 text-right text-muted-foreground">{row.ledsX}×{row.ledsY}</td>
                                 <td className="px-4 py-2 text-right text-yellow-400 font-medium">{row.ledsPerPiece}</td>
                                 <td className="px-4 py-2 text-right font-bold">{row.totalLeds}</td>
                                 <td className="px-4 py-2 text-right text-orange-400">{row.totalPower.toFixed(1)}</td>
@@ -972,7 +1185,7 @@ export default function NestingApp() {
                           </tbody>
                           <tfoot>
                             <tr className="bg-background font-semibold">
-                              <td className="px-4 py-2 text-muted-foreground" colSpan={5}>TOTAL</td>
+                              <td className="px-4 py-2 text-muted-foreground" colSpan={4}>TOTAL</td>
                               <td className="px-4 py-2 text-right text-yellow-400 text-sm">{ledSummary.totalLeds.toLocaleString("pt-BR")}</td>
                               <td className="px-4 py-2 text-right text-orange-400">{ledSummary.totalPower.toFixed(1)}</td>
                             </tr>
