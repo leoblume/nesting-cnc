@@ -783,9 +783,15 @@ export default function NestingApp() {
     const rows = groups.map((g) => {
       const poly = g.parts[0]?.outer ?? [];
       const holes = g.parts[0]?.holes ?? [];
-      const { totalLeds, pitch } = poly.length
-        ? calcLedsForPart(poly, holes, selectedLed, borderMargin)
-        : { ...calcLedsForBbox(g.width, g.height, selectedLed, borderMargin), positions: [] };
+      let totalLeds = 0;
+      let pitch = 0;
+      if (poly.length) {
+        const r = calcLedsForPart(poly, holes, selectedLed, borderMargin);
+        totalLeds = r.totalLeds; pitch = r.pitch;
+      } else {
+        const r = calcLedsForBbox(g.width, g.height, selectedLed, borderMargin);
+        totalLeds = r.totalLeds; pitch = r.pitch;
+      }
       const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, selectedLed, borderMargin);
       const totalPower = totalLeds * selectedLed.power * g.quantity;
       return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, totalPower };
