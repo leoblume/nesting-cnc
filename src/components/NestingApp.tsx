@@ -102,59 +102,59 @@ function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
-function calcLedsForPart(
+function calcLedsForPartWithRotation(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  borderMargin = 4,
-  letterHeight: number | null = null,
-  ledRotation: 0 | 90 = 0,
+  borderMargin: number,
+  letterHeight: number | null,
+  rotation: 0 | 90,
 ): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }> } {
   if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [] };
 
-  // Bounding box
+  // Shrink polygon inward by borderMargin to get the inner area
+  const inner = shrinkPolygon(polygon, borderMargin);
+  if (inner.length < 3) return { totalLeds: 0, pitch: 0, positions: [] };
+
+  // Bounding box of the INNER (shrunk) polygon — not the original bbox
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of polygon) {
+  for (const p of inner) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
-  const bboxW = maxX - minX;
-  const bboxH = maxY - minY;
+  const innerW = maxX - minX;
+  const innerH = maxY - minY;
+
+  if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
 
   let pitch: number;
   if (letterHeight && letterHeight > 0) {
-    // New rule: pitch = letterHeight - 15%
+    // Rule: pitch = letterHeight - 15%
     pitch = calcPitchFromLetterHeight(letterHeight);
   } else {
-    // Fallback: old thickness-based rule
-    const innerW = bboxW - 2 * borderMargin;
-    const innerH = bboxH - 2 * borderMargin;
-    if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
-    const thickness = Math.min(innerW, innerH);
-    const maxPitch = thickness * 0.9;
-    // Apply rotation to LED dimensions
-    const ledW = ledRotation === 90 ? ledModel.height : ledModel.width;
-    const ledH = ledRotation === 90 ? ledModel.width : ledModel.height;
+    // Fallback: use LED physical size as pitch (largest dimension)
+    const ledW = rotation === 90 ? ledModel.height : ledModel.width;
+    const ledH = rotation === 90 ? ledModel.width : ledModel.height;
     const ledRef = Math.max(ledW, ledH);
-    pitch = Math.min(ledRef, maxPitch);
+    const thickness = Math.min(innerW, innerH);
+    pitch = Math.min(ledRef, thickness * 0.9);
   }
 
   if (pitch <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
 
-  // Shrink polygon inward by borderMargin
-  const inner = shrinkPolygon(polygon, borderMargin);
-
-  // Grid scan
+  // Grid scan strictly inside the shrunk polygon
   const positions: Array<{ x: number; y: number }> = [];
-  const cols = Math.max(1, Math.floor(bboxW / pitch));
-  const rows = Math.max(1, Math.floor(bboxH / pitch));
-  const offsetX = (bboxW - cols * pitch) / 2;
-  const offsetY = (bboxH - rows * pitch) / 2;
+  const cols = Math.floor(innerW / pitch);
+  const rows = Math.floor(innerH / pitch);
 
-  for (let row = 0; row <= rows; row++) {
-    for (let col = 0; col <= cols; col++) {
-      const x = minX + offsetX + col * pitch;
-      const y = minY + offsetY + row * pitch;
+  // Center the grid within the inner bounding box
+  const offsetX = (innerW - cols * pitch) / 2;
+  const offsetY = (innerH - rows * pitch) / 2;
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const x = minX + offsetX + (col + 0.5) * pitch;
+      const y = minY + offsetY + (row + 0.5) * pitch;
       const pt = { x, y };
 
       if (!pointInPoly(pt, inner)) continue;
@@ -170,6 +170,38 @@ function calcLedsForPart(
   return { totalLeds: positions.length, pitch, positions };
 }
 
+function calcLedsForPart(
+  polygon: Point[],
+  holes: Point[][],
+  ledModel: LedModel,
+  borderMargin = 4,
+  letterHeight: number | null = null,
+  ledRotation: 0 | 90 = 0,
+): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
+  if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [], bestRotation: ledRotation };
+
+  // Try both rotations and pick the one that fits more LEDs inside the shape
+  const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0);
+  const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90);
+
+  // Auto-select best rotation (most LEDs fit), but honour manual override if it's close
+  let bestRotation: 0 | 90 = ledRotation;
+  let best = ledRotation === 0 ? r0 : r90;
+
+  if (r0.totalLeds === 0 && r90.totalLeds === 0) {
+    return { totalLeds: 0, pitch: 0, positions: [], bestRotation: ledRotation };
+  }
+
+  // If the non-selected rotation yields strictly more LEDs, auto-switch
+  const other = ledRotation === 0 ? r90 : r0;
+  if (other.totalLeds > best.totalLeds) {
+    best = other;
+    bestRotation = ledRotation === 0 ? 90 : 0;
+  }
+
+  return { ...best, bestRotation };
+}
+
 // Legacy bbox-based calc (quick approximation)
 function calcLedsForBbox(
   partWidth: number,
@@ -183,22 +215,29 @@ function calcLedsForBbox(
   const innerH = partHeight - 2 * borderMargin;
   if (innerW <= 0 || innerH <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
 
-  let pitch: number;
-  if (letterHeight && letterHeight > 0) {
-    pitch = calcPitchFromLetterHeight(letterHeight);
-  } else {
-    const thickness = Math.min(innerW, innerH);
-    const maxPitch = thickness * 0.9;
-    const ledW = ledRotation === 90 ? ledModel.height : ledModel.width;
-    const ledH = ledRotation === 90 ? ledModel.width : ledModel.height;
-    const ledRef = Math.max(ledW, ledH);
-    pitch = Math.min(ledRef, maxPitch);
-  }
+  const calcForRotation = (rot: 0 | 90) => {
+    let pitch: number;
+    if (letterHeight && letterHeight > 0) {
+      pitch = calcPitchFromLetterHeight(letterHeight);
+    } else {
+      const thickness = Math.min(innerW, innerH);
+      const ledW = rot === 90 ? ledModel.height : ledModel.width;
+      const ledH = rot === 90 ? ledModel.width : ledModel.height;
+      const ledRef = Math.max(ledW, ledH);
+      pitch = Math.min(ledRef, thickness * 0.9);
+    }
+    if (pitch <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
+    const ledsX = Math.floor(innerW / pitch);
+    const ledsY = Math.floor(innerH / pitch);
+    return { ledsX: Math.max(0, ledsX), ledsY: Math.max(0, ledsY), totalLeds: Math.max(0, ledsX) * Math.max(0, ledsY), pitch };
+  };
 
-  if (pitch <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
-  const ledsX = Math.max(1, Math.floor(innerW / pitch) + 1);
-  const ledsY = Math.max(1, Math.floor(innerH / pitch) + 1);
-  return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch };
+  const r0 = calcForRotation(0);
+  const r90 = calcForRotation(90);
+  // Auto-pick best rotation unless explicit preference and it's not worse
+  const preferred = ledRotation === 0 ? r0 : r90;
+  const other = ledRotation === 0 ? r90 : r0;
+  return other.totalLeds > preferred.totalLeds ? other : preferred;
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────
@@ -296,11 +335,11 @@ function renderSheet(
 
     // Draw LEDs following actual polygon shape
     if (showLeds && ledModel) {
-      const { positions, totalLeds } = calcLedsForPart(part.polygon, part.holes, ledModel, borderMargin, letterHeight, ledRotation);
+      const { positions, totalLeds, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, borderMargin, letterHeight, ledRotation);
 
-      // LED physical size in screen pixels (respect rotation)
-      const rawW = ledRotation === 90 ? ledModel.height : ledModel.width;
-      const rawH = ledRotation === 90 ? ledModel.width : ledModel.height;
+      // LED physical size in screen pixels (use auto-selected rotation)
+      const rawW = partRot === 90 ? ledModel.height : ledModel.width;
+      const rawH = partRot === 90 ? ledModel.width : ledModel.height;
       const ledW = Math.max(2, rawW * scale);
       const ledH = Math.max(2, rawH * scale);
 
@@ -640,11 +679,11 @@ function LedDrawingCanvas({
         ctx.setLineDash([]);
 
         if (ledModel) {
-          const { positions, totalLeds, pitch } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+          const { positions, totalLeds, pitch, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
 
-          // LED dims with rotation
-          const rawW = ledRotation === 90 ? ledModel.height : ledModel.width;
-          const rawH = ledRotation === 90 ? ledModel.width : ledModel.height;
+          // LED dims with auto-selected rotation
+          const rawW = partRot === 90 ? ledModel.height : ledModel.width;
+          const rawH = partRot === 90 ? ledModel.width : ledModel.height;
           const ledW = Math.max(1.5, rawW * s);
           const ledH = Math.max(1.5, rawH * s);
 
@@ -684,7 +723,7 @@ function LedDrawingCanvas({
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(ledModel.name + (ledRotation === 90 ? " ↺90°" : ""), ox + pw / 2, oy + ph + 20);
+          ctx.fillText(ledModel.name + (partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
 
           const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
           const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
@@ -843,9 +882,9 @@ function printPlan(
         }
 
         if (ledModel) {
-          const { positions } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
-          const rawW = ledRotation === 90 ? ledModel.height : ledModel.width;
-          const rawH = ledRotation === 90 ? ledModel.width : ledModel.height;
+          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+          const rawW = partRot === 90 ? ledModel.height : ledModel.width;
+          const rawH = partRot === 90 ? ledModel.width : ledModel.height;
           const ledW = Math.max(1.5, rawW * S);
           const ledH = Math.max(1.5, rawH * S);
           for (const pos of positions) {
