@@ -95,113 +95,78 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation — perimeter-following with any-angle auto-rotation ─────
-// pitch = letterHeight × 0.85  (altura da letra − 15%)
-// A mesma distância é usada em X e Y (espaçamento uniforme, sem margem de borda)
-// Auto-rotação: testa múltiplos ângulos e usa o que cabe mais LEDs dentro do polígono
+// ─── LED Calculation — path-following (centerline) ─────────────────────────
 
 function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
-// ── Rotate a list of points around a center ──────────────────────────────────
-function rotatePoints(pts: Point[], cx: number, cy: number, angleDeg: number): Point[] {
-  const a = (angleDeg * Math.PI) / 180;
-  const cos = Math.cos(a), sin = Math.sin(a);
-  return pts.map((p) => ({
-    x: cx + (p.x - cx) * cos - (p.y - cy) * sin,
-    y: cy + (p.x - cx) * sin + (p.y - cy) * cos,
-  }));
-}
-
-// ── Scan a rotated grid over the polygon, return positions in original coords ─
-function scanGridAtAngle(
+function samplePolygonPath(
   polygon: Point[],
-  holes: Point[][],
-  pitch: number,
-  angleDeg: number,
-): Array<{ x: number; y: number; angleDeg: number }> {
-  if (!polygon.length || pitch <= 0) return [];
+  spacing: number,
+): Array<{ x: number; y: number }> {
+  const pts: Array<{ x: number; y: number }> = [];
 
-  // Centroid of polygon
-  let cx = 0, cy = 0;
-  for (const p of polygon) { cx += p.x; cy += p.y; }
-  cx /= polygon.length; cy /= polygon.length;
+  if (!polygon.length || spacing <= 0) return pts;
 
-  // Rotate polygon and holes to align grid with angleDeg = 0
-  const neg = -angleDeg;
-  const rotPoly  = rotatePoints(polygon, cx, cy, neg);
-  const rotHoles = holes.map((h) => rotatePoints(h, cx, cy, neg));
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i];
+    const b = polygon[(i + 1) % polygon.length];
 
-  // Bounding box in rotated space
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of rotPoly) {
-    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-  }
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
 
-  // Grid scan in rotated space — no border margin, LEDs respect polygon boundary
-  const positions: Array<{ x: number; y: number; angleDeg: number }> = [];
-  const cols = Math.ceil((maxX - minX) / pitch) + 1;
-  const rows = Math.ceil((maxY - minY) / pitch) + 1;
-  // Center the grid
-  const offX = minX + ((maxX - minX) - (cols - 1) * pitch) / 2;
-  const offY = minY + ((maxY - minY) - (rows - 1) * pitch) / 2;
+    const len = Math.hypot(dx, dy);
+    const steps = Math.max(1, Math.floor(len / spacing));
 
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const rx = offX + c * pitch;
-      const ry = offY + r * pitch;
-      const pt = { x: rx, y: ry };
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
 
-      if (!pointInPoly(pt, rotPoly)) continue;
-      let inHole = false;
-      for (const h of rotHoles) {
-        if (pointInPoly(pt, h)) { inHole = true; break; }
-      }
-      if (inHole) continue;
-
-      // Rotate back to original coords
-      const orig = rotatePoints([pt], cx, cy, angleDeg)[0];
-      positions.push({ x: orig.x, y: orig.y, angleDeg });
+      pts.push({
+        x: a.x + dx * t,
+        y: a.y + dy * t,
+      });
     }
   }
-  return positions;
-}
 
-// ── Choose the best rotation angle for the LED grid ──────────────────────────
-// Tests several angles and picks the one that fits the most LEDs
-const AUTO_ANGLES = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165];
+  const deduped: Array<{ x: number; y: number }> = [];
+  const seen = new Set<string>();
+
+  for (const pt of pts) {
+    const key = `${Math.round(pt.x)}_${Math.round(pt.y)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(pt);
+  }
+
+  return deduped;
+}
 
 function calcLedsForPart(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  _borderMargin = 0,       // kept for signature compat — not used in formula
+  _borderMargin = 0,
   letterHeight: number | null = null,
 ): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }>; bestAngle: number } {
   if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [], bestAngle: 0 };
 
   const pitch = (letterHeight && letterHeight > 0)
     ? calcPitchFromLetterHeight(letterHeight)
-    : (() => {
-        // fallback: use max LED dimension as pitch
-        return Math.max(ledModel.width, ledModel.height) * 1.1;
-      })();
+    : Math.max(ledModel.width, ledModel.height) * 1.1;
 
   if (pitch <= 0) return { totalLeds: 0, pitch: 0, positions: [], bestAngle: 0 };
 
-  let best: Array<{ x: number; y: number; angleDeg: number }> = [];
-  for (const angle of AUTO_ANGLES) {
-    const pts = scanGridAtAngle(polygon, holes, pitch, angle);
-    if (pts.length > best.length) best = pts;
-  }
+  const positions = [
+    ...samplePolygonPath(polygon, pitch),
+    ...holes.flatMap((hole) => samplePolygonPath(hole, pitch)),
+  ];
 
   return {
-    totalLeds: best.length,
+    totalLeds: positions.length,
     pitch,
-    positions: best,
-    bestAngle: best.length > 0 ? best[0].angleDeg : 0,
+    positions,
+    bestAngle: 0,
   };
 }
 
