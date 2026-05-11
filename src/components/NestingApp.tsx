@@ -1169,12 +1169,17 @@ export default function NestingApp() {
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
       <header className="flex items-center gap-3 border-b border-border px-6 py-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
+        <button
+          onClick={() => window.location.reload()}
+          className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-80"
+          title="Recarregar página"
+        >
           <Layers className="h-5 w-5" />
-        </div>
+        </button>
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 9.0</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1476,31 +1481,7 @@ export default function NestingApp() {
                   )}
                 </div>
 
-                {/* Formula display */}
-                {selectedLed && (
-                  <div className="col-span-2 rounded-md bg-background border border-border p-3">
-                    <p className="text-xs font-mono text-muted-foreground leading-relaxed">
-                      {letterHeight && letterHeight > 0 ? (
-                        <>
-                          <span className="text-yellow-400">altura_letra</span> = {letterHeight} mm<br />
-                          <span className="text-orange-400">pitch_base</span> = {letterHeight} × 0,85 = <strong className="text-white">{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong><br />
-                          <span className="text-cyan-400">nCols</span> = floor(largura ÷ pitch_base) &nbsp;|&nbsp; <span className="text-cyan-400">nRows</span> = floor(altura ÷ pitch_base)<br />
-                          <span className="text-green-400">↔ pitchX</span> = largura ÷ nCols &nbsp;(espaçamento real no comprimento)<br />
-                          <span className="text-green-400">↕ pitchY</span> = altura ÷ nRows &nbsp;(espaçamento real na altura)<br />
-                          <span className="text-purple-400">posições</span> = filtradas pela forma real do polígono
-                        </>
-                      ) : (
-                        <>
-                          <span className="text-blue-400">pitch_base</span> = min(LED_ref, espessura × 0,9)<br />
-                          <span className="text-green-400">LED_ref</span> = max({selectedLed.width}, {selectedLed.height}) = {Math.max(selectedLed.width, selectedLed.height)} mm<br />
-                          <span className="text-cyan-400">nCols</span> = floor(larg ÷ pitch_base) &nbsp;|&nbsp; <span className="text-cyan-400">nRows</span> = floor(alt ÷ pitch_base)<br />
-                          <span className="text-green-400">↔ pitchX</span> = largura ÷ nCols &nbsp;|&nbsp; <span className="text-green-400">↕ pitchY</span> = altura ÷ nRows<br />
-                          <span className="text-purple-400">posições</span> = filtradas pela forma real do polígono
-                        </>
-                      )}
-                    </p>
-                  </div>
-                )}
+
               </div>
 
               {!groups.length ? (
