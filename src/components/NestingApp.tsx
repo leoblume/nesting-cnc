@@ -105,6 +105,39 @@ function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
+function generateManualLedPositions(
+  polygon: Point[],
+  holes: Point[][],
+  targetCount: number,
+): Array<{ x: number; y: number }> {
+  if (!polygon.length || targetCount <= 0) return [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of polygon) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const aspect = width / Math.max(height, 1);
+  const cols = Math.max(1, Math.ceil(Math.sqrt(targetCount * aspect)));
+  const rows = Math.max(1, Math.ceil(targetCount / cols));
+  const pitchX = width / cols;
+  const pitchY = height / rows;
+  const positions: Array<{ x: number; y: number }> = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const pt = { x: minX + (col + 0.5) * pitchX, y: minY + (row + 0.5) * pitchY };
+      if (!pointInPoly(pt, polygon)) continue;
+      if (holes.some((hole) => pointInPoly(pt, hole))) continue;
+      positions.push(pt);
+      if (positions.length >= targetCount) return positions;
+    }
+  }
+  return positions;
+}
+
 function calcLedsForPartWithRotation(
   polygon: Point[],
   holes: Point[][],
@@ -129,7 +162,7 @@ function calcLedsForPartWithRotation(
   // Pitch base: determina quantas colunas e linhas cabem
   let pitchBase: number;
   if (letterHeight && letterHeight > 0) {
-    pitchBase = calcPitchFromLetterHeight(letterHeight);
+    pitchBase = Math.max(calcPitchFromLetterHeight(letterHeight), Math.max(ledModel.width, ledModel.height) * 0.65);
   } else {
     const ledW = rotation === 90 ? ledModel.height : ledModel.width;
     const ledH = rotation === 90 ? ledModel.width : ledModel.height;
@@ -206,7 +239,7 @@ function calcLedsForBbox(
   const calcForRotation = (rot: 0 | 90) => {
     let pitchBase: number;
     if (letterHeight && letterHeight > 0) {
-      pitchBase = calcPitchFromLetterHeight(letterHeight);
+      pitchBase = Math.max(calcPitchFromLetterHeight(letterHeight), Math.max(ledModel.width, ledModel.height) * 0.65);
     } else {
       const ledW = rot === 90 ? ledModel.height : ledModel.width;
       const ledH = rot === 90 ? ledModel.width : ledModel.height;
@@ -539,6 +572,7 @@ function LedDrawingCanvas({
   borderMargin = 4,
   letterHeight = null,
   ledRotation = 0,
+  manualLedCounts = {},
 }: {
   groups: ReturnType<typeof groupParts>;
   ledModels: LedModel[];
@@ -547,6 +581,7 @@ function LedDrawingCanvas({
   borderMargin?: number;
   letterHeight?: number | null;
   ledRotation?: 0 | 90;
+  manualLedCounts?: Record<string, number>;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -651,7 +686,11 @@ function LedDrawingCanvas({
         // No border margin indicator needed
 
         if (ledModel) {
-          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+          const manualCount = manualLedCounts[g.key] ?? 0;
+          const manualPositions = manualCount > 0 ? generateManualLedPositions(poly, holes, manualCount) : [];
+          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = manualCount > 0
+            ? { positions: manualPositions, totalLeds: manualPositions.length, pitch: 0, pitchX: 0, pitchY: 0, bestRotation: 0 as 0 | 90 }
+            : calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
 
           // LED dims with auto-selected rotation
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
@@ -1002,6 +1041,7 @@ export default function NestingApp() {
   });
   // Per-group LED assignments (group key -> led id)
   const [ledAssignments, setLedAssignments] = useState<LedAssignment>({});
+  const [manualLedCounts, setManualLedCounts] = useState<Record<string, number>>({});
   // LED rotation is always automatic (no manual control)
   const ledRotation: 0 | 90 = 0; // kept for function signatures, auto-rotation happens inside calcLedsForPart
   // Letter height for pitch calculation
@@ -1093,7 +1133,7 @@ export default function NestingApp() {
       opts.sheetWidth, opts.sheetHeight, opts.margin,
       selectedLed, showLeds, 0, letterHeight, 0
     );
-  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterHeight]);
+  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterHeight, ledKey, renderedLedId]);
 
   useEffect(() => { redraw(); }, [redraw]);
 
@@ -1137,7 +1177,10 @@ export default function NestingApp() {
       const poly = g.parts[0]?.outer ?? [];
       const holes = g.parts[0]?.holes ?? [];
       let totalLeds = 0, pitch = 0, pitchX = 0, pitchY = 0;
-      if (poly.length) {
+      const manualCount = manualLedCounts[g.key] ?? 0;
+      if (manualCount > 0 && poly.length) {
+        totalLeds = manualCount;
+      } else if (poly.length) {
         const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
         totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       } else {
@@ -1151,7 +1194,7 @@ export default function NestingApp() {
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey, manualLedCounts]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
@@ -1563,6 +1606,19 @@ export default function NestingApp() {
                     </div>
                   )}
 
+                  <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/5 p-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-yellow-300 mb-3">Quantidade manual de LEDs</h3>
+                    <div className="grid grid-cols-2 gap-2">
+                      {groups.map((g) => (
+                        <div key={g.key} className="flex items-center gap-2 rounded border border-border p-2">
+                          <div className="text-[11px] font-mono min-w-28">{g.width.toFixed(0)}×{g.height.toFixed(0)} mm</div>
+                          <Input type="number" min={0} value={manualLedCounts[g.key] ?? ""} onChange={(e) => { const v = parseInt(e.target.value || "0", 10); setManualLedCounts((prev) => ({ ...prev, [g.key]: isNaN(v) ? 0 : v })); }} placeholder="auto" className="h-8 text-xs" />
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-2">Ao informar uma quantidade manual, a distribuição ignora a regra da altura da letra.</p>
+                  </div>
+
                   {ledSummary && (
                     <div className="grid grid-cols-3 gap-4">
                       <div className="rounded-lg border border-border bg-card p-4">
@@ -1605,6 +1661,7 @@ export default function NestingApp() {
                       borderMargin={0}
                       letterHeight={letterHeight}
                       ledRotation={0}
+                      manualLedCounts={manualLedCounts}
                     />
                   </div>
 
