@@ -106,14 +106,14 @@ function calcLedsForPartWithRotation(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  borderMargin: number,
+  _borderMargin: number,
   letterHeight: number | null,
   rotation: 0 | 90,
 ): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }> } {
   if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [] };
 
-  // Shrink polygon inward by borderMargin to get the inner area
-  const inner = shrinkPolygon(polygon, borderMargin);
+  // No border margin — use the polygon directly
+  const inner = polygon;
   if (inner.length < 3) return { totalLeds: 0, pitch: 0, positions: [] };
 
   // Bounding box of the INNER (shrunk) polygon — not the original bbox
@@ -211,8 +211,9 @@ function calcLedsForBbox(
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
 ): { ledsX: number; ledsY: number; totalLeds: number; pitch: number } {
-  const innerW = partWidth - 2 * borderMargin;
-  const innerH = partHeight - 2 * borderMargin;
+  // No border margin — use full part dimensions
+  const innerW = partWidth;
+  const innerH = partHeight;
   if (innerW <= 0 || innerH <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
 
   const calcForRotation = (rot: 0 | 90) => {
@@ -335,7 +336,7 @@ function renderSheet(
 
     // Draw LEDs following actual polygon shape
     if (showLeds && ledModel) {
-      const { positions, totalLeds, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, borderMargin, letterHeight, ledRotation);
+      const { positions, totalLeds, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, 0, letterHeight, ledRotation);
 
       // LED physical size in screen pixels (use auto-selected rotation)
       const rawW = partRot === 90 ? ledModel.height : ledModel.width;
@@ -662,24 +663,10 @@ function LedDrawingCanvas({
           ctx.stroke();
         }
 
-        // Border margin visual indicator
-        const shrunk = shrinkPolygon(poly, borderMargin);
-        ctx.beginPath();
-        const sshr0 = toScreen(shrunk[0]);
-        ctx.moveTo(sshr0.x, sshr0.y);
-        for (let i = 1; i < shrunk.length; i++) {
-          const ssp = toScreen(shrunk[i]);
-          ctx.lineTo(ssp.x, ssp.y);
-        }
-        ctx.closePath();
-        ctx.strokeStyle = "#60a5fa55";
-        ctx.lineWidth = 0.5;
-        ctx.setLineDash([2, 2]);
-        ctx.stroke();
-        ctx.setLineDash([]);
+        // No border margin indicator needed
 
         if (ledModel) {
-          const { positions, totalLeds, pitch, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+          const { positions, totalLeds, pitch, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
 
           // LED dims with auto-selected rotation
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
@@ -725,7 +712,7 @@ function LedDrawingCanvas({
           ctx.textBaseline = "top";
           ctx.fillText(ledModel.name + (partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
 
-          const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
+          const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
           ctx.fillStyle = "#10b981";
           ctx.font = "8px monospace";
@@ -765,7 +752,7 @@ function LedDrawingCanvas({
         ctx.strokeRect(ox, oy, pw, ph);
 
         if (ledModel) {
-          const { totalLeds, pitch } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
+          const { totalLeds, pitch } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
@@ -779,7 +766,7 @@ function LedDrawingCanvas({
         }
       }
     });
-  }, [groups, ledModels, selectedLedId, ledAssignments, borderMargin, letterHeight, ledRotation, resolveLed]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, resolveLed]);
 
   return (
     <div className="overflow-auto rounded-lg border border-border bg-[#0f172a] p-2">
@@ -824,7 +811,7 @@ function printPlan(
     wrapper.style.width = "900px"; wrapper.style.height = "600px";
     wrapper.appendChild(canvas);
     document.body.appendChild(wrapper);
-    renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, globalLed, showLeds, borderMargin, letterHeight, ledRotation);
+    renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, globalLed, showLeds, 0, letterHeight, ledRotation);
     sheetDataUrls.push(canvas.toDataURL("image/png"));
     document.body.removeChild(wrapper);
   }
@@ -840,10 +827,10 @@ function printPlan(
       let totalLeds = 0, pitch = 0;
       if (ledModel) {
         if (poly.length) {
-          const r = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+          const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
           totalLeds = r.totalLeds; pitch = r.pitch;
         } else {
-          const r = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
+          const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           totalLeds = r.totalLeds; pitch = r.pitch;
         }
       }
@@ -882,7 +869,7 @@ function printPlan(
         }
 
         if (ledModel) {
-          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
           const rawH = partRot === 90 ? ledModel.width : ledModel.height;
           const ledW = Math.max(1.5, rawW * S);
@@ -959,7 +946,7 @@ function printPlan(
     html += `<div class="stats-grid">
   <div class="stat-box"><div class="stat-label">Total de LEDs</div><div class="stat-val">${ledSummary.totalLeds.toLocaleString("pt-BR")}</div></div>
   <div class="stat-box"><div class="stat-label">Potência total</div><div class="stat-val">${ledSummary.totalPower.toFixed(1)} W</div></div>
-  <div class="stat-box"><div class="stat-label">Rotação LED</div><div class="stat-val">${ledRotation}°</div></div>
+  <div class="stat-box"><div class="stat-label">Rotação LED</div><div class="stat-val">Auto</div></div>
 </div>`;
   }
   html += `</div>`;
@@ -975,7 +962,7 @@ function printPlan(
   html += `</div>`;
 
   if (ledUrls.length) {
-    html += `<div class="section"><div class="section-title">Plano de Posicionamento LED (margem ${borderMargin}mm${letterHeight ? `, altura letra ${letterHeight}mm` : ""})</div>
+    html += `<div class="section"><div class="section-title">Plano de Posicionamento LED${letterHeight ? ` (altura letra ${letterHeight}mm)` : ""}</div>
 <div class="led-grid">`;
     groups.forEach((g, gi) => {
       html += `<div class="led-card"><img class="led-img" src="${ledUrls[gi]}" /></div>`;
@@ -1030,16 +1017,15 @@ export default function NestingApp() {
   });
   // Per-group LED assignments (group key -> led id)
   const [ledAssignments, setLedAssignments] = useState<LedAssignment>({});
-  // LED rotation: 0 or 90 degrees
-  const [ledRotation, setLedRotation] = useState<0 | 90>(0);
+  // LED rotation is always automatic (no manual control)
+  const ledRotation: 0 | 90 = 0; // kept for function signatures, auto-rotation happens inside calcLedsForPart
   // Letter height for pitch calculation
   const [letterHeight, setLetterHeight] = useState<number | null>(null);
   const [letterHeightInput, setLetterHeightInput] = useState("");
 
   const [showLeds, setShowLeds] = useState(true);
-  const [borderMargin, setBorderMargin] = useState(4);
+  const borderMargin = 0; // no border margin
   const [renderedLedId, setRenderedLedId] = useState<string | null>(null);
-  const [renderedMargin, setRenderedMargin] = useState<number>(4);
   const [ledKey, setLedKey] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1047,7 +1033,7 @@ export default function NestingApp() {
   const setOpt = <K extends keyof NestingOptions>(key: K, val: NestingOptions[K]) => setOpts((p) => ({ ...p, [key]: val }));
 
   const selectedLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
-  const ledNeedsUpdate = selectedLedId !== renderedLedId || borderMargin !== renderedMargin;
+  const ledNeedsUpdate = selectedLedId !== renderedLedId;
 
   // Assign a specific LED to a group
   const assignLedToGroup = useCallback((groupKey: string, ledId: string) => {
@@ -1068,13 +1054,11 @@ export default function NestingApp() {
   const handleUpdateLed = useCallback(() => {
     setLedKey((k) => k + 1);
     setRenderedLedId(selectedLedId);
-    setRenderedMargin(borderMargin);
-  }, [selectedLedId, borderMargin]);
+  }, [selectedLedId]);
 
   useEffect(() => {
     if (selectedLedId && renderedLedId === null) {
       setRenderedLedId(selectedLedId);
-      setRenderedMargin(borderMargin);
       setLedKey((k) => k + 1);
     }
   }, [selectedLedId]);
@@ -1122,9 +1106,9 @@ export default function NestingApp() {
       canvasRef.current,
       result.sheets[activeSheet] ?? [],
       opts.sheetWidth, opts.sheetHeight, opts.margin,
-      selectedLed, showLeds, borderMargin, letterHeight, ledRotation
+      selectedLed, showLeds, 0, letterHeight, 0
     );
-  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, borderMargin, letterHeight, ledRotation]);
+  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterHeight]);
 
   useEffect(() => { redraw(); }, [redraw]);
 
@@ -1169,20 +1153,20 @@ export default function NestingApp() {
       const holes = g.parts[0]?.holes ?? [];
       let totalLeds = 0, pitch = 0;
       if (poly.length) {
-        const r = calcLedsForPart(poly, holes, ledModel, borderMargin, letterHeight, ledRotation);
+        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
         totalLeds = r.totalLeds; pitch = r.pitch;
       } else {
-        const r = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
+        const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
         totalLeds = r.totalLeds; pitch = r.pitch;
       }
-      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, borderMargin, letterHeight, ledRotation);
+      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
       const totalPower = totalLeds * ledModel.power * g.quantity;
       return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, totalPower, ledName: ledModel.name };
     });
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, ledModels, selectedLedId, ledAssignments, borderMargin, letterHeight, ledRotation, ledKey]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
@@ -1285,7 +1269,7 @@ export default function NestingApp() {
             <Button
               variant="outline"
               className="w-full border-slate-600 text-slate-300 hover:bg-slate-800 hover:text-white"
-              onClick={() => printPlan(result, opts, ledModels, selectedLedId, ledAssignments, showLeds, borderMargin, letterHeight, ledRotation, groups, ledSummary, fileName || "sem-nome.pdf")}
+              onClick={() => printPlan(result, opts, ledModels, selectedLedId, ledAssignments, showLeds, 0, letterHeight, 0, groups, ledSummary, fileName || "sem-nome.pdf")}
             >
               <Printer className="mr-2 h-4 w-4" /> Imprimir Plano de Corte
             </Button>
@@ -1483,34 +1467,6 @@ export default function NestingApp() {
                   )}
                 </div>
 
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">Margem de borda (mm)</Label>
-                  <Input type="number" min={0} step={0.5} value={borderMargin}
-                    onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= 0) setBorderMargin(v); }}
-                    className="h-8 text-sm" />
-                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">Área respeita margem mínima da borda</p>
-                </div>
-
-                {/* LED rotation */}
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">Rotação do módulo LED</Label>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => { setLedRotation(0); setLedKey((k) => k + 1); }}
-                      className={`flex-1 h-8 rounded border text-xs font-medium transition-colors ${ledRotation === 0 ? "border-blue-500 bg-blue-500/20 text-blue-300" : "border-border text-muted-foreground hover:border-border/80"}`}
-                    >
-                      0° (normal)
-                    </button>
-                    <button
-                      onClick={() => { setLedRotation(90); setLedKey((k) => k + 1); }}
-                      className={`flex-1 h-8 rounded border text-xs font-medium transition-colors ${ledRotation === 90 ? "border-purple-500 bg-purple-500/20 text-purple-300" : "border-border text-muted-foreground hover:border-border/80"}`}
-                    >
-                      90° (girado)
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">Gira o módulo para melhor ajuste nas formas</p>
-                </div>
-
                 {/* Global LED selector */}
                 <div className="col-span-2 flex flex-col gap-1">
                   <Label className="text-xs text-muted-foreground">LED padrão (para todas as peças sem atribuição)</Label>
@@ -1547,7 +1503,7 @@ export default function NestingApp() {
                         </>
                       ) : (
                         <>
-                          <span className="text-blue-400">espessura</span> = min(larg, alt) − 2 × {borderMargin}mm<br />
+                          <span className="text-blue-400">espessura</span> = min(larg, alt)<br />
                           <span className="text-yellow-400">pitch_máx</span> = espessura × 0,9<br />
                           <span className="text-green-400">LED_ref</span> = max({selectedLed.width}, {selectedLed.height}) = {Math.max(selectedLed.width, selectedLed.height)} mm<br />
                           <span className="text-orange-400">pitch_final</span> = min(LED_ref, pitch_máx)<br />
@@ -1631,9 +1587,9 @@ export default function NestingApp() {
                         <p className="text-2xl font-bold text-orange-400">{ledSummary.totalPower.toFixed(1)} W</p>
                       </div>
                       <div className="rounded-lg border border-border bg-card p-4">
-                        <p className="text-xs text-muted-foreground mb-1">{letterHeight ? "Pitch (alt. letra)" : "Margem de borda"}</p>
+                        <p className="text-xs text-muted-foreground mb-1">{letterHeight ? "Pitch (alt. letra)" : "Pitch (automático)"}</p>
                         <p className="text-2xl font-bold text-blue-400">
-                          {letterHeight ? `${computedPitch?.toFixed(1)} mm` : `${borderMargin} mm`}
+                          {letterHeight ? `${computedPitch?.toFixed(1)} mm` : `auto`}
                         </p>
                         {letterHeight && <p className="text-[10px] text-muted-foreground mt-1">letra {letterHeight}mm − 15%</p>}
                       </div>
@@ -1652,8 +1608,7 @@ export default function NestingApp() {
                       )}
                     </div>
                     <p className="text-xs text-muted-foreground mb-3">
-                      Retângulos amarelos = LEDs em tamanho real · linha pontilhada = margem de {borderMargin}mm · posições filtradas pela forma da peça
-                      {ledRotation === 90 && " · módulo girado 90°"}
+                      Retângulos amarelos = LEDs em tamanho real · posições filtradas pela forma da peça · giro automático
                     </p>
                     <LedDrawingCanvas
                       key={ledKey}
@@ -1661,9 +1616,9 @@ export default function NestingApp() {
                       ledModels={ledModels}
                       selectedLedId={activeLedForDisplay?.id ?? selectedLedId}
                       ledAssignments={ledAssignments}
-                      borderMargin={borderMargin}
+                      borderMargin={0}
                       letterHeight={letterHeight}
-                      ledRotation={ledRotation}
+                      ledRotation={0}
                     />
                   </div>
 
