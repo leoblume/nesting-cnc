@@ -95,30 +95,30 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation ──────────────────────────────────────────────────────────
-// pitch base = letterHeight * 0.85  (altura da letra − 15%)
-// nCols = floor(W / pitchBase)   nRows = floor(H / pitchBase)
-// pitchX = W / nCols  (distância real entre LEDs no eixo X = comprimento)
-// pitchY = H / nRows  (distância real entre LEDs no eixo Y = altura)
-// → espaçamento uniforme em cada eixo, proporcional à dimensão real da peça
+// ─── LED Calculation Engine ────────────────────────────────────────────────────
+// Motor A: GRID  — grade uniforme filtrada pela forma
+// Motor B: CENTERLINE — LEDs ao longo da linha central (esqueleto) da peça
+
+export type LedEngine = "grid" | "centerline";
+
+const DEFAULT_THICKNESS_MM = 50; // espessura padrão quando não informada
+
 function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
-function calcLedsForPartWithRotation(
+// ── GRID ENGINE ───────────────────────────────────────────────────────────────
+function calcLedsGrid(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  _borderMargin: number,
   letterHeight: number | null,
   rotation: 0 | 90,
 ): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
-  if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
-  const inner = polygon;
-  if (inner.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+  if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of inner) {
+  for (const p of polygon) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
@@ -126,7 +126,6 @@ function calcLedsForPartWithRotation(
   const innerH = maxY - minY;
   if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // Pitch base: determina quantas colunas e linhas cabem
   let pitchBase: number;
   if (letterHeight && letterHeight > 0) {
     pitchBase = calcPitchFromLetterHeight(letterHeight);
@@ -135,36 +134,156 @@ function calcLedsForPartWithRotation(
     const ledH = rotation === 90 ? ledModel.width : ledModel.height;
     const ledRef = Math.max(ledW, ledH);
     const thickness = Math.min(innerW, innerH);
-    pitchBase = Math.min(ledRef, thickness * 0.9);
+    const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
+    pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
   }
   if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // Número de divisões em cada eixo (mínimo 1)
   const cols = Math.max(1, Math.floor(innerW / pitchBase));
   const rows = Math.max(1, Math.floor(innerH / pitchBase));
+  const pitchX = innerW / cols;
+  const pitchY = innerH / rows;
 
-  // Espaçamento real em cada eixo: distância uniforme = dimensão / n
-  const pitchX = innerW / cols;   // espaçamento real no comprimento (X)
-  const pitchY = innerH / rows;   // espaçamento real na altura (Y)
-
-  // Grade: LEDs centrados em cada célula
   const positions: Array<{ x: number; y: number }> = [];
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       const x = minX + (col + 0.5) * pitchX;
       const y = minY + (row + 0.5) * pitchY;
       const pt = { x, y };
-      if (!pointInPoly(pt, inner)) continue;
+      if (!pointInPoly(pt, polygon)) continue;
       let inHole = false;
-      for (const hole of holes) {
-        if (pointInPoly(pt, hole)) { inHole = true; break; }
-      }
+      for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
       if (inHole) continue;
       positions.push({ x, y });
     }
   }
-
   return { totalLeds: positions.length, pitch: pitchBase, pitchX, pitchY, positions };
+}
+
+// ── CENTERLINE ENGINE ─────────────────────────────────────────────────────────
+// Princípio: para cada scanline perpendicular à direção principal, encontra os
+// dois bordas do polígono e coloca o LED no ponto médio (linha central).
+// Assim os LEDs seguem o esqueleto da forma, como na Figura 2.
+function calcLedsCenterline(
+  polygon: Point[],
+  holes: Point[][],
+  ledModel: LedModel,
+  letterHeight: number | null,
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
+  if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of polygon) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const W = maxX - minX;
+  const H = maxY - minY;
+  if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+
+  // Determina espessura média do objeto (dimensão menor do bbox)
+  const estimatedThickness = letterHeight && letterHeight > 0
+    ? letterHeight
+    : Math.min(W, H) > 0 ? Math.min(W, H) : DEFAULT_THICKNESS_MM;
+
+  // Pitch ao longo do comprimento principal
+  let pitch: number;
+  if (letterHeight && letterHeight > 0) {
+    pitch = calcPitchFromLetterHeight(letterHeight);
+  } else {
+    const ledRef = Math.max(ledModel.width, ledModel.height);
+    pitch = Math.min(ledRef, estimatedThickness * 0.9);
+    if (pitch <= 0) pitch = ledRef > 0 ? ledRef : DEFAULT_THICKNESS_MM * 0.7;
+  }
+
+  // Detecta direção principal: mais longo eixo
+  const alongX = W >= H; // varre ao longo de X se o objeto é mais horizontal
+
+  // Função auxiliar: interseções de scanline horizontal (y=ty) com o polígono
+  function scanlineX(ty: number, poly: Point[]): number[] {
+    const xs: number[] = [];
+    for (let i = 0, n = poly.length; i < n; i++) {
+      const a = poly[i], b = poly[(i + 1) % n];
+      if ((a.y <= ty && b.y > ty) || (b.y <= ty && a.y > ty)) {
+        const t = (ty - a.y) / (b.y - a.y);
+        xs.push(a.x + t * (b.x - a.x));
+      }
+    }
+    return xs.sort((a, b) => a - b);
+  }
+
+  // Função auxiliar: interseções de scanline vertical (x=tx) com o polígono
+  function scanlineY(tx: number, poly: Point[]): number[] {
+    const ys: number[] = [];
+    for (let i = 0, n = poly.length; i < n; i++) {
+      const a = poly[i], b = poly[(i + 1) % n];
+      if ((a.x <= tx && b.x > tx) || (b.x <= tx && a.x > tx)) {
+        const t = (tx - a.x) / (b.x - a.x);
+        ys.push(a.y + t * (b.y - a.y));
+      }
+    }
+    return ys.sort((a, b) => a - b);
+  }
+
+  const positions: Array<{ x: number; y: number }> = [];
+
+  if (alongX) {
+    // Varre X com passo = pitch; para cada X, encontra a linha central em Y
+    const steps = Math.max(1, Math.round(W / pitch));
+    const actualPitch = W / steps;
+    for (let i = 0; i < steps; i++) {
+      const tx = minX + (i + 0.5) * actualPitch;
+      const ys = scanlineY(tx, polygon);
+      if (ys.length < 2) continue;
+      // Para cada par de bordas: ponto médio = linha central
+      for (let j = 0; j + 1 < ys.length; j += 2) {
+        const yMid = (ys[j] + ys[j + 1]) / 2;
+        const pt = { x: tx, y: yMid };
+        // Verifica que não está em buraco
+        let inHole = false;
+        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
+        if (!inHole) positions.push(pt);
+      }
+    }
+    const pitchX = steps > 0 ? W / steps : pitch;
+    const pitchY = pitch;
+    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
+  } else {
+    // Varre Y com passo = pitch; para cada Y, linha central em X
+    const steps = Math.max(1, Math.round(H / pitch));
+    const actualPitch = H / steps;
+    for (let i = 0; i < steps; i++) {
+      const ty = minY + (i + 0.5) * actualPitch;
+      const xs = scanlineX(ty, polygon);
+      if (xs.length < 2) continue;
+      for (let j = 0; j + 1 < xs.length; j += 2) {
+        const xMid = (xs[j] + xs[j + 1]) / 2;
+        const pt = { x: xMid, y: ty };
+        let inHole = false;
+        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
+        if (!inHole) positions.push(pt);
+      }
+    }
+    const pitchX = pitch;
+    const pitchY = steps > 0 ? H / steps : pitch;
+    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
+  }
+}
+
+// ── Dispatcher ────────────────────────────────────────────────────────────────
+function calcLedsForPartWithRotation(
+  polygon: Point[],
+  holes: Point[][],
+  ledModel: LedModel,
+  _borderMargin: number,
+  letterHeight: number | null,
+  rotation: 0 | 90,
+  engine: LedEngine = "centerline",
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
+  if (engine === "centerline") {
+    return calcLedsCenterline(polygon, holes, ledModel, letterHeight);
+  }
+  return calcLedsGrid(polygon, holes, ledModel, letterHeight, rotation);
 }
 
 function calcLedsForPart(
@@ -174,17 +293,22 @@ function calcLedsForPart(
   borderMargin = 0,
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
+  engine: LedEngine = "centerline",
 ): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
   if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: ledRotation };
 
-  const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0);
-  const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90);
+  if (engine === "centerline") {
+    const r = calcLedsCenterline(polygon, holes, ledModel, letterHeight);
+    return { ...r, bestRotation: 0 };
+  }
+
+  const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0, "grid");
+  const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90, "grid");
 
   if (r0.totalLeds === 0 && r90.totalLeds === 0) {
     return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0 };
   }
 
-  // Auto-seleciona a rotação que encaixa mais LEDs
   const best = r90.totalLeds > r0.totalLeds ? r90 : r0;
   const bestRotation: 0 | 90 = r90.totalLeds > r0.totalLeds ? 90 : 0;
   return { ...best, bestRotation };
@@ -211,7 +335,9 @@ function calcLedsForBbox(
       const ledW = rot === 90 ? ledModel.height : ledModel.width;
       const ledH = rot === 90 ? ledModel.width : ledModel.height;
       const ledRef = Math.max(ledW, ledH);
-      pitchBase = Math.min(ledRef, Math.min(W, H) * 0.9);
+      const thickness = Math.min(W, H);
+      const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
+      pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
     }
     if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
     const ledsX = Math.max(1, Math.floor(W / pitchBase));
@@ -539,6 +665,7 @@ function LedDrawingCanvas({
   borderMargin = 4,
   letterHeight = null,
   ledRotation = 0,
+  engine = "centerline",
 }: {
   groups: ReturnType<typeof groupParts>;
   ledModels: LedModel[];
@@ -547,6 +674,7 @@ function LedDrawingCanvas({
   borderMargin?: number;
   letterHeight?: number | null;
   ledRotation?: 0 | 90;
+  engine?: LedEngine;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -583,7 +711,7 @@ function LedDrawingCanvas({
 
     const ctx = canvas.getContext("2d")!;
     ctx.scale(dpr, dpr);
-    ctx.fillStyle = "#0f172a";
+    ctx.fillStyle = engine === "centerline" ? "#f8fafc" : "#0f172a";
     ctx.fillRect(0, 0, totalW, totalH);
 
     groups.forEach((g, gi) => {
@@ -625,9 +753,10 @@ function LedDrawingCanvas({
           ctx.lineTo(sp.x, sp.y);
         }
         ctx.closePath();
-        ctx.fillStyle = "#1e3a5f";
+        // White/light fill for centerline look (like Figura 2)
+        ctx.fillStyle = engine === "centerline" ? "#f0f9ff" : "#1e3a5f";
         ctx.fill();
-        ctx.strokeStyle = "#3b82f6";
+        ctx.strokeStyle = engine === "centerline" ? "#2563eb" : "#3b82f6";
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
@@ -641,61 +770,79 @@ function LedDrawingCanvas({
             ctx.lineTo(sh.x, sh.y);
           }
           ctx.closePath();
-          ctx.fillStyle = "#0f172a";
+          ctx.fillStyle = engine === "centerline" ? "#0f172a" : "#0f172a";
           ctx.fill();
           ctx.strokeStyle = "#60a5fa88";
           ctx.lineWidth = 1;
           ctx.stroke();
         }
 
-        // No border margin indicator needed
-
         if (ledModel) {
-          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, engine);
 
           // LED dims with auto-selected rotation
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
           const rawH = partRot === 90 ? ledModel.width : ledModel.height;
-          const ledW = Math.max(1.5, rawW * s);
-          const ledH = Math.max(1.5, rawH * s);
+          const ledW = Math.max(2, rawW * s);
+          const ledH = Math.max(2, rawH * s);
+          const ledR = Math.max(2, Math.min(ledW, ledH) / 2);
 
           for (const pos of positions) {
             const lx = ox + (pos.x - pminX) * s;
             const ly = oy + (pos.y - pminY) * s;
 
-            const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(ledW, ledH));
-            grd.addColorStop(0, "#fde68aaa");
-            grd.addColorStop(1, "#f59e0b00");
-            ctx.beginPath();
-            ctx.arc(lx, ly, Math.max(ledW, ledH), 0, Math.PI * 2);
-            ctx.fillStyle = grd;
-            ctx.fill();
-
-            ctx.fillStyle = "#fde68a";
-            ctx.strokeStyle = "#f59e0b";
-            ctx.lineWidth = 0.5;
-            ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
-            ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+            if (engine === "centerline") {
+              // Glow halo
+              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, ledR * 2.2);
+              grd.addColorStop(0, "#fde68a99");
+              grd.addColorStop(1, "#f59e0b00");
+              ctx.beginPath();
+              ctx.arc(lx, ly, ledR * 2.2, 0, Math.PI * 2);
+              ctx.fillStyle = grd;
+              ctx.fill();
+              // LED dot (round)
+              ctx.beginPath();
+              ctx.arc(lx, ly, ledR, 0, Math.PI * 2);
+              ctx.fillStyle = "#fde68a";
+              ctx.fill();
+              ctx.strokeStyle = "#d97706";
+              ctx.lineWidth = 0.7;
+              ctx.stroke();
+            } else {
+              // Grid: rectangle with glow
+              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(ledW, ledH));
+              grd.addColorStop(0, "#fde68aaa");
+              grd.addColorStop(1, "#f59e0b00");
+              ctx.beginPath();
+              ctx.arc(lx, ly, Math.max(ledW, ledH), 0, Math.PI * 2);
+              ctx.fillStyle = grd;
+              ctx.fill();
+              ctx.fillStyle = "#fde68a";
+              ctx.strokeStyle = "#f59e0b";
+              ctx.lineWidth = 0.5;
+              ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+              ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+            }
           }
 
-          ctx.fillStyle = "#94a3b8";
+          ctx.fillStyle = engine === "centerline" ? "#475569" : "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
           ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
 
-          ctx.fillStyle = "#fde68a";
+          ctx.fillStyle = engine === "centerline" ? "#1e40af" : "#fde68a";
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
           ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
 
           // LED name badge
-          ctx.fillStyle = "#a855f7";
+          ctx.fillStyle = engine === "centerline" ? "#7c3aed" : "#a855f7";
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(ledModel.name + (partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
+          ctx.fillText(ledModel.name + (engine === "centerline" ? " (linha central)" : partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
 
           const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
@@ -705,7 +852,7 @@ function LedDrawingCanvas({
           ctx.textBaseline = "top";
           ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 32);
         } else {
-          ctx.fillStyle = "#94a3b8";
+          ctx.fillStyle = engine === "centerline" ? "#94a3b8" : "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
@@ -730,7 +877,7 @@ function LedDrawingCanvas({
         ctx.fillText(`×${g.quantity}`, ox + pw - badgeW / 2 - 2, oy + 2 + badgeH / 2);
 
       } else {
-        ctx.fillStyle = "#1e3a5f";
+        ctx.fillStyle = engine === "centerline" ? "#e0f2fe" : "#1e3a5f";
         ctx.strokeStyle = "#3b82f6";
         ctx.lineWidth = 1.5;
         ctx.fillRect(ox, oy, pw, ph);
@@ -751,10 +898,12 @@ function LedDrawingCanvas({
         }
       }
     });
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, resolveLed]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, engine, resolveLed]);
+
+  const bgColor = engine === "centerline" ? "#f8fafc" : "#0f172a";
 
   return (
-    <div className="overflow-auto rounded-lg border border-border bg-[#0f172a] p-2">
+    <div className="overflow-auto rounded-lg border border-border p-2" style={{ background: bgColor }}>
       <canvas ref={canvasRef} className="block" />
     </div>
   );
@@ -1007,6 +1156,8 @@ export default function NestingApp() {
   // Letter height for pitch calculation
   const [letterHeight, setLetterHeight] = useState<number | null>(null);
   const [letterHeightInput, setLetterHeightInput] = useState("");
+  // LED calculation engine
+  const [ledEngine, setLedEngine] = useState<LedEngine>("centerline");
 
   const [showLeds, setShowLeds] = useState(true);
   const borderMargin = 0; // no border margin
@@ -1138,7 +1289,7 @@ export default function NestingApp() {
       const holes = g.parts[0]?.holes ?? [];
       let totalLeds = 0, pitch = 0, pitchX = 0, pitchY = 0;
       if (poly.length) {
-        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
         totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       } else {
         const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
@@ -1151,7 +1302,7 @@ export default function NestingApp() {
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey, ledEngine]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
@@ -1179,7 +1330,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 9.0</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 9.1</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1409,63 +1560,81 @@ export default function NestingApp() {
 
           {/* ── LEDs TAB ── */}
           {activeTab === "leds" && (
-            <div className="flex flex-1 flex-col overflow-y-auto p-6 gap-6">
-              <div className="flex items-center gap-3">
-                <div className="flex h-8 w-8 items-center justify-center rounded-md bg-yellow-500/20">
-                  <Lightbulb className="h-4 w-4 text-yellow-400" />
-                </div>
-                <div>
-                  <h2 className="text-sm font-semibold">Calculadora de LEDs</h2>
-                  <p className="text-xs text-muted-foreground">Posicionamento automático respeitando a forma real da peça</p>
-                </div>
-              </div>
-
-              {/* ── Parameters card ── */}
-              <div className="rounded-lg border border-border bg-card p-4 grid grid-cols-2 gap-4">
-                <div className="col-span-2">
-                  <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Parâmetros de Cálculo</h3>
+            <div className="flex flex-1 overflow-hidden">
+              {/* ── LEFT: Controls panel ── */}
+              <div className="flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-4">
+                <div className="flex items-center gap-2">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-md bg-yellow-500/20">
+                    <Lightbulb className="h-3.5 w-3.5 text-yellow-400" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold">Calculadora de LEDs</h2>
+                    <p className="text-[10px] text-muted-foreground">Posicionamento automático por forma real</p>
+                  </div>
                 </div>
 
-                {/* Letra height — NEW primary input */}
-                <div className="col-span-2 rounded-md border border-yellow-500/40 bg-yellow-500/5 p-3 flex flex-col gap-2">
-                  <Label className="text-xs font-semibold text-yellow-300">Altura da letra (mm)</Label>
+                {/* ── Motor selector ── */}
+                <div className="rounded-lg border border-border bg-background p-3 flex flex-col gap-2">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Motor de Cálculo</p>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      onClick={() => { setLedEngine("centerline"); setLedKey((k) => k + 1); }}
+                      className={`flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-[10px] font-medium transition-all ${ledEngine === "centerline" ? "border-yellow-500/60 bg-yellow-500/10 text-yellow-300" : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground"}`}
+                    >
+                      <span className="text-base">〰️</span>
+                      <span>Linha Central</span>
+                      <span className="text-[9px] opacity-60">esqueleto da forma</span>
+                    </button>
+                    <button
+                      onClick={() => { setLedEngine("grid"); setLedKey((k) => k + 1); }}
+                      className={`flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-[10px] font-medium transition-all ${ledEngine === "grid" ? "border-blue-500/60 bg-blue-500/10 text-blue-300" : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground"}`}
+                    >
+                      <span className="text-base">⊞</span>
+                      <span>Grid</span>
+                      <span className="text-[9px] opacity-60">grade filtrada</span>
+                    </button>
+                  </div>
+                  <p className="text-[9px] text-muted-foreground/60 italic">
+                    {ledEngine === "centerline"
+                      ? "LEDs no centro da espessura da peça, ao longo do comprimento"
+                      : "Grade uniforme com filtro pela forma real do polígono"}
+                  </p>
+                </div>
+
+                {/* ── Letter height / espessura ── */}
+                <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 flex flex-col gap-2">
+                  <Label className="text-[10px] font-semibold text-yellow-300 uppercase tracking-wider">Altura da letra (mm)</Label>
                   <div className="flex gap-2 items-center">
                     <Input
-                      type="number"
-                      min={1}
-                      step={1}
-                      placeholder="Ex: 100"
+                      type="number" min={1} step={1} placeholder={`Ex: 100`}
                       value={letterHeightInput}
                       onChange={(e) => {
                         setLetterHeightInput(e.target.value);
                         const v = parseFloat(e.target.value);
                         setLetterHeight(!isNaN(v) && v > 0 ? v : null);
                       }}
-                      className="h-8 text-sm flex-1"
+                      className="h-7 text-xs flex-1"
                     />
                     {letterHeight && letterHeight > 0 && (
-                      <div className="text-xs text-yellow-300 font-mono whitespace-nowrap">
-                        → pitch: <strong>{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong>
+                      <div className="text-[10px] text-yellow-300 font-mono whitespace-nowrap">
+                        → <strong>{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong>
                       </div>
                     )}
                   </div>
-                  <p className="text-[10px] text-yellow-400/70">
-                    Pitch = altura − 15% · Usado tanto na largura quanto na altura do grid de LEDs
+                  <p className="text-[9px] text-yellow-400/70">
+                    Pitch = altura × 0,85 · Se vazio: usa espessura padrão {DEFAULT_THICKNESS_MM} mm
                   </p>
-                  {!letterHeight && (
-                    <p className="text-[10px] text-muted-foreground/50 italic">Se não informado, usa cálculo automático pela espessura da peça</p>
-                  )}
                 </div>
 
-                {/* Global LED selector */}
-                <div className="col-span-2 flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">LED padrão (para todas as peças sem atribuição)</Label>
+                {/* ── Global LED selector ── */}
+                <div className="flex flex-col gap-1.5">
+                  <Label className="text-[10px] text-muted-foreground uppercase tracking-wider">LED padrão</Label>
                   {ledModels.length === 0 ? (
                     <p className="text-xs text-muted-foreground italic">Cadastre um LED na aba "Cadastro LED"</p>
                   ) : (
                     <div className="flex gap-2">
                       <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); }}>
-                        <SelectTrigger className="h-8 text-sm flex-1"><SelectValue placeholder="Selecionar LED padrão" /></SelectTrigger>
+                        <SelectTrigger className="h-7 text-xs flex-1"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
                         <SelectContent>
                           {ledModels.map((l) => (
                             <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
@@ -1473,168 +1642,156 @@ export default function NestingApp() {
                         </SelectContent>
                       </Select>
                       {selectedLedId && (
-                        <Button onClick={handleUpdateLed} variant="outline" className="h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10 whitespace-nowrap">
-                          <RefreshCw className="h-3.5 w-3.5 mr-1" /> Atualizar
+                        <Button onClick={handleUpdateLed} variant="outline" className="h-7 text-[10px] border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10 px-2">
+                          <RefreshCw className="h-3 w-3" />
                         </Button>
                       )}
                     </div>
                   )}
                 </div>
 
-
-              </div>
-
-              {!groups.length ? (
-                <div className="flex flex-1 items-center justify-center">
-                  <p className="text-sm text-muted-foreground">Importe e interprete um PDF para visualizar os LEDs.</p>
-                </div>
-              ) : ledModels.length === 0 ? (
-                <div className="flex flex-1 items-center justify-center flex-col gap-2">
-                  <Zap className="h-8 w-8 text-muted-foreground/30" />
-                  <p className="text-sm text-muted-foreground">Selecione ou cadastre um LED para calcular o posicionamento.</p>
-                  <Button variant="secondary" className="mt-2 text-xs h-8" onClick={() => setActiveTab("ledcad")}>
-                    <Plus className="h-3.5 w-3.5 mr-1" /> Cadastrar LED
-                  </Button>
-                </div>
-              ) : (
-                <>
-                  {/* ── Per-group LED assignment ── */}
-                  {ledModels.length > 1 && (
-                    <div className="rounded-lg border border-blue-500/30 bg-blue-500/5 p-4">
-                      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-blue-300 flex items-center gap-1.5">
-                        <Zap className="h-3.5 w-3.5" /> Atribuição de LED por Peça
-                      </h3>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        Selecione um LED específico para cada modelo de peça. Letras menores podem usar módulos menores.
-                      </p>
-                      <div className="flex flex-col gap-2">
-                        {groups.map((g) => {
-                          const assignedId = ledAssignments[g.key] ?? selectedLedId ?? "";
-                          return (
-                            <div key={g.key} className="flex items-center gap-2">
-                              <div className="text-xs text-muted-foreground w-28 shrink-0 font-mono">
-                                {g.width.toFixed(0)}×{g.height.toFixed(0)} mm ×{g.quantity}
-                              </div>
-                              <Select
-                                value={assignedId}
-                                onValueChange={(v) => assignLedToGroup(g.key, v)}
-                              >
-                                <SelectTrigger className="h-7 text-xs flex-1">
-                                  <SelectValue placeholder="LED padrão" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {ledModels.map((l) => (
-                                    <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                              {ledAssignments[g.key] && (
-                                <button
-                                  onClick={() => clearGroupAssignment(g.key)}
-                                  className="text-muted-foreground hover:text-destructive shrink-0"
-                                  title="Usar LED padrão"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </button>
-                              )}
+                {/* ── Per-group assignments ── */}
+                {ledModels.length > 1 && (
+                  <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 flex flex-col gap-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-300 flex items-center gap-1">
+                      <Zap className="h-3 w-3" /> LED por peça
+                    </p>
+                    <div className="flex flex-col gap-1.5">
+                      {groups.map((g) => {
+                        const assignedId = ledAssignments[g.key] ?? selectedLedId ?? "";
+                        return (
+                          <div key={g.key} className="flex items-center gap-1.5">
+                            <div className="text-[10px] text-muted-foreground w-24 shrink-0 font-mono truncate">
+                              {g.width.toFixed(0)}×{g.height.toFixed(0)} ×{g.quantity}
                             </div>
-                          );
-                        })}
-                      </div>
+                            <Select value={assignedId} onValueChange={(v) => assignLedToGroup(g.key, v)}>
+                              <SelectTrigger className="h-6 text-[10px] flex-1"><SelectValue placeholder="padrão" /></SelectTrigger>
+                              <SelectContent>
+                                {ledModels.map((l) => (
+                                  <SelectItem key={l.id} value={l.id}>{l.name}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            {ledAssignments[g.key] && (
+                              <button onClick={() => clearGroupAssignment(g.key)} className="text-muted-foreground hover:text-destructive shrink-0">
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
-                  )}
+                  </div>
+                )}
 
-                  {ledSummary && (
-                    <div className="grid grid-cols-3 gap-4">
-                      <div className="rounded-lg border border-border bg-card p-4">
-                        <p className="text-xs text-muted-foreground mb-1">Total de LEDs</p>
-                        <p className="text-2xl font-bold text-yellow-400">{ledSummary.totalLeds.toLocaleString("pt-BR")}</p>
-                        <p className="text-[10px] text-muted-foreground mt-1">contagem por forma real</p>
+                {/* ── Summary cards ── */}
+                {ledSummary && (
+                  <div className="flex flex-col gap-2">
+                    <div className="rounded-lg border border-border bg-background p-3">
+                      <p className="text-[10px] text-muted-foreground mb-0.5">Total de LEDs</p>
+                      <p className="text-xl font-bold text-yellow-400">{ledSummary.totalLeds.toLocaleString("pt-BR")}</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="rounded-lg border border-border bg-background p-3">
+                        <p className="text-[10px] text-muted-foreground mb-0.5">Potência</p>
+                        <p className="text-base font-bold text-orange-400">{ledSummary.totalPower.toFixed(1)} W</p>
                       </div>
-                      <div className="rounded-lg border border-border bg-card p-4">
-                        <p className="text-xs text-muted-foreground mb-1">Potência total</p>
-                        <p className="text-2xl font-bold text-orange-400">{ledSummary.totalPower.toFixed(1)} W</p>
-                      </div>
-                      <div className="rounded-lg border border-border bg-card p-4">
-                        <p className="text-xs text-muted-foreground mb-1">{letterHeight ? "Pitch (alt. letra)" : "Pitch (automático)"}</p>
-                        <p className="text-2xl font-bold text-blue-400">
+                      <div className="rounded-lg border border-border bg-background p-3">
+                        <p className="text-[10px] text-muted-foreground mb-0.5">Pitch</p>
+                        <p className="text-base font-bold text-blue-400">
                           {letterHeight ? `${computedPitch?.toFixed(1)} mm` : `auto`}
                         </p>
-                        {letterHeight && <p className="text-[10px] text-muted-foreground mt-1">letra {letterHeight}mm − 15%</p>}
                       </div>
                     </div>
-                  )}
+                  </div>
+                )}
 
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
-                        <Zap className="h-3.5 w-3.5 text-yellow-400" /> Desenho de Posicionamento para Produção
-                      </h3>
-                      <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-7 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
+                {/* ── Detail table ── */}
+                {ledSummary && (
+                  <div className="rounded-lg border border-border bg-background overflow-hidden">
+                    <div className="px-3 py-2 border-b border-border">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Por Modelo</p>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[10px]">
+                        <thead>
+                          <tr className="border-b border-border">
+                            <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">Dim (mm)</th>
+                            <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">Qtd</th>
+                            <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">LEDs/pç</th>
+                            <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">Total</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {ledSummary.rows.map((row, i) => (
+                            <tr key={i} className="border-b border-border/40 hover:bg-muted/20">
+                              <td className="px-2 py-1 font-mono">{row.width.toFixed(0)}×{row.height.toFixed(0)}</td>
+                              <td className="px-2 py-1 text-right">{row.qty}</td>
+                              <td className="px-2 py-1 text-right text-yellow-400 font-medium">{row.ledsPerPiece}</td>
+                              <td className="px-2 py-1 text-right font-bold">{row.totalLeds}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                        <tfoot>
+                          <tr className="bg-muted/30 font-semibold">
+                            <td className="px-2 py-1.5 text-muted-foreground" colSpan={3}>TOTAL</td>
+                            <td className="px-2 py-1.5 text-right text-yellow-400">{ledSummary.totalLeds.toLocaleString("pt-BR")}</td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ── RIGHT: Canvas ── */}
+              <div className="flex flex-1 flex-col overflow-hidden">
+                {!groups.length ? (
+                  <div className="flex flex-1 items-center justify-center">
+                    <p className="text-sm text-muted-foreground">Importe e interprete um PDF para visualizar os LEDs.</p>
+                  </div>
+                ) : ledModels.length === 0 ? (
+                  <div className="flex flex-1 items-center justify-center flex-col gap-2">
+                    <Zap className="h-8 w-8 text-muted-foreground/30" />
+                    <p className="text-sm text-muted-foreground">Cadastre um LED para calcular o posicionamento.</p>
+                    <Button variant="secondary" className="mt-2 text-xs h-8" onClick={() => setActiveTab("ledcad")}>
+                      <Plus className="h-3.5 w-3.5 mr-1" /> Cadastrar LED
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex flex-1 flex-col overflow-hidden">
+                    {/* Canvas header */}
+                    <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-card shrink-0">
+                      <div className="flex items-center gap-2">
+                        <Zap className="h-3.5 w-3.5 text-yellow-400" />
+                        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                          Desenho de Posicionamento
+                        </span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${ledEngine === "centerline" ? "bg-yellow-500/20 text-yellow-400" : "bg-blue-500/20 text-blue-400"}`}>
+                          {ledEngine === "centerline" ? "Linha Central" : "Grid"}
+                        </span>
+                      </div>
+                      <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-6 text-[10px] border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
                         <RefreshCw className="h-3 w-3 mr-1" /> Atualizar
                       </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground mb-3">
-                      Retângulos amarelos = LEDs em tamanho real · posições filtradas pela forma da peça · giro automático
-                    </p>
-                    <LedDrawingCanvas
-                      key={ledKey}
-                      groups={groups}
-                      ledModels={ledModels}
-                      selectedLedId={activeLedForDisplay?.id ?? selectedLedId}
-                      ledAssignments={ledAssignments}
-                      borderMargin={0}
-                      letterHeight={letterHeight}
-                      ledRotation={0}
-                    />
-                  </div>
-
-                  {ledSummary && (
-                    <div className="rounded-lg border border-border bg-card overflow-hidden">
-                      <div className="px-4 py-3 border-b border-border">
-                        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Detalhamento por Modelo</h3>
-                      </div>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-xs">
-                          <thead>
-                            <tr className="border-b border-border bg-background">
-                              <th className="px-4 py-2 text-left font-medium text-muted-foreground">Dimensões (mm)</th>
-                              <th className="px-4 py-2 text-left font-medium text-muted-foreground">LED</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">Qtd</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">↔ PitchX (mm)</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">↕ PitchY (mm)</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">LEDs/peça</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">Total LEDs</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">Potência (W)</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {ledSummary.rows.map((row, i) => (
-                              <tr key={i} className="border-b border-border/50 hover:bg-muted/30 transition-colors">
-                                <td className="px-4 py-2 font-mono">{row.width.toFixed(0)} × {row.height.toFixed(0)}</td>
-                                <td className="px-4 py-2 text-purple-300 text-[11px]">{row.ledName}</td>
-                                <td className="px-4 py-2 text-right">{row.qty}</td>
-                                <td className="px-4 py-2 text-right text-cyan-400">{row.pitchX?.toFixed(1) ?? row.pitch.toFixed(1)}</td>
-                                <td className="px-4 py-2 text-right text-cyan-400">{row.pitchY?.toFixed(1) ?? row.pitch.toFixed(1)}</td>
-                                <td className="px-4 py-2 text-right text-yellow-400 font-medium">{row.ledsPerPiece}</td>
-                                <td className="px-4 py-2 text-right font-bold">{row.totalLeds}</td>
-                                <td className="px-4 py-2 text-right text-orange-400">{row.totalPower.toFixed(1)}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                          <tfoot>
-                            <tr className="bg-background font-semibold">
-                              <td className="px-4 py-2 text-muted-foreground" colSpan={6}>TOTAL</td>
-                              <td className="px-4 py-2 text-right text-yellow-400 text-sm">{ledSummary.totalLeds.toLocaleString("pt-BR")}</td>
-                              <td className="px-4 py-2 text-right text-orange-400">{ledSummary.totalPower.toFixed(1)}</td>
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
+                    {/* Scrollable canvas area */}
+                    <div className="flex-1 overflow-auto p-4">
+                      <LedDrawingCanvas
+                        key={ledKey}
+                        groups={groups}
+                        ledModels={ledModels}
+                        selectedLedId={activeLedForDisplay?.id ?? selectedLedId}
+                        ledAssignments={ledAssignments}
+                        borderMargin={0}
+                        letterHeight={letterHeight}
+                        ledRotation={0}
+                        engine={ledEngine}
+                      />
                     </div>
-                  )}
-                </>
-              )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
