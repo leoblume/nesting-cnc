@@ -95,9 +95,12 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation with letter height pitch rule ────────────────────────
-// pitch = letterHeight * 0.85 (i.e. letterHeight - 15%)
-// Used both for X and Y spacing of LED grid
+// ─── LED Calculation ──────────────────────────────────────────────────────────
+// pitch base = letterHeight * 0.85  (altura da letra − 15%)
+// nCols = floor(W / pitchBase)   nRows = floor(H / pitchBase)
+// pitchX = W / nCols  (distância real entre LEDs no eixo X = comprimento)
+// pitchY = H / nRows  (distância real entre LEDs no eixo Y = altura)
+// → espaçamento uniforme em cada eixo, proporcional à dimensão real da peça
 function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
@@ -109,14 +112,11 @@ function calcLedsForPartWithRotation(
   _borderMargin: number,
   letterHeight: number | null,
   rotation: 0 | 90,
-): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }> } {
-  if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [] };
-
-  // No border margin — use the polygon directly
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
+  if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
   const inner = polygon;
-  if (inner.length < 3) return { totalLeds: 0, pitch: 0, positions: [] };
+  if (inner.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // Bounding box of the INNER (shrunk) polygon — not the original bbox
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of inner) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
@@ -124,39 +124,36 @@ function calcLedsForPartWithRotation(
   }
   const innerW = maxX - minX;
   const innerH = maxY - minY;
+  if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
-
-  let pitch: number;
+  // Pitch base: determina quantas colunas e linhas cabem
+  let pitchBase: number;
   if (letterHeight && letterHeight > 0) {
-    // Rule: pitch = letterHeight - 15%
-    pitch = calcPitchFromLetterHeight(letterHeight);
+    pitchBase = calcPitchFromLetterHeight(letterHeight);
   } else {
-    // Fallback: use LED physical size as pitch (largest dimension)
     const ledW = rotation === 90 ? ledModel.height : ledModel.width;
     const ledH = rotation === 90 ? ledModel.width : ledModel.height;
     const ledRef = Math.max(ledW, ledH);
     const thickness = Math.min(innerW, innerH);
-    pitch = Math.min(ledRef, thickness * 0.9);
+    pitchBase = Math.min(ledRef, thickness * 0.9);
   }
+  if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  if (pitch <= 0) return { totalLeds: 0, pitch: 0, positions: [] };
+  // Número de divisões em cada eixo (mínimo 1)
+  const cols = Math.max(1, Math.floor(innerW / pitchBase));
+  const rows = Math.max(1, Math.floor(innerH / pitchBase));
 
-  // Grid scan strictly inside the shrunk polygon
+  // Espaçamento real em cada eixo: distância uniforme = dimensão / n
+  const pitchX = innerW / cols;   // espaçamento real no comprimento (X)
+  const pitchY = innerH / rows;   // espaçamento real na altura (Y)
+
+  // Grade: LEDs centrados em cada célula
   const positions: Array<{ x: number; y: number }> = [];
-  const cols = Math.floor(innerW / pitch);
-  const rows = Math.floor(innerH / pitch);
-
-  // Center the grid within the inner bounding box
-  const offsetX = (innerW - cols * pitch) / 2;
-  const offsetY = (innerH - rows * pitch) / 2;
-
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      const x = minX + offsetX + (col + 0.5) * pitch;
-      const y = minY + offsetY + (row + 0.5) * pitch;
+      const x = minX + (col + 0.5) * pitchX;
+      const y = minY + (row + 0.5) * pitchY;
       const pt = { x, y };
-
       if (!pointInPoly(pt, inner)) continue;
       let inHole = false;
       for (const hole of holes) {
@@ -167,78 +164,66 @@ function calcLedsForPartWithRotation(
     }
   }
 
-  return { totalLeds: positions.length, pitch, positions };
+  return { totalLeds: positions.length, pitch: pitchBase, pitchX, pitchY, positions };
 }
 
 function calcLedsForPart(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  borderMargin = 4,
+  borderMargin = 0,
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
-): { totalLeds: number; pitch: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
-  if (!polygon.length) return { totalLeds: 0, pitch: 0, positions: [], bestRotation: ledRotation };
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
+  if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: ledRotation };
 
-  // Try both rotations and pick the one that fits more LEDs inside the shape
   const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0);
   const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90);
 
-  // Auto-select best rotation (most LEDs fit), but honour manual override if it's close
-  let bestRotation: 0 | 90 = ledRotation;
-  let best = ledRotation === 0 ? r0 : r90;
-
   if (r0.totalLeds === 0 && r90.totalLeds === 0) {
-    return { totalLeds: 0, pitch: 0, positions: [], bestRotation: ledRotation };
+    return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0 };
   }
 
-  // If the non-selected rotation yields strictly more LEDs, auto-switch
-  const other = ledRotation === 0 ? r90 : r0;
-  if (other.totalLeds > best.totalLeds) {
-    best = other;
-    bestRotation = ledRotation === 0 ? 90 : 0;
-  }
-
+  // Auto-seleciona a rotação que encaixa mais LEDs
+  const best = r90.totalLeds > r0.totalLeds ? r90 : r0;
+  const bestRotation: 0 | 90 = r90.totalLeds > r0.totalLeds ? 90 : 0;
   return { ...best, bestRotation };
 }
 
-// Legacy bbox-based calc (quick approximation)
+// Aproximação bbox (para sumário e tabela)
 function calcLedsForBbox(
   partWidth: number,
   partHeight: number,
   ledModel: LedModel,
-  borderMargin = 4,
+  borderMargin = 0,
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
-): { ledsX: number; ledsY: number; totalLeds: number; pitch: number } {
-  // No border margin — use full part dimensions
-  const innerW = partWidth;
-  const innerH = partHeight;
-  if (innerW <= 0 || innerH <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
+): { ledsX: number; ledsY: number; totalLeds: number; pitch: number; pitchX: number; pitchY: number } {
+  const W = partWidth;
+  const H = partHeight;
+  if (W <= 0 || H <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
 
   const calcForRotation = (rot: 0 | 90) => {
-    let pitch: number;
+    let pitchBase: number;
     if (letterHeight && letterHeight > 0) {
-      pitch = calcPitchFromLetterHeight(letterHeight);
+      pitchBase = calcPitchFromLetterHeight(letterHeight);
     } else {
-      const thickness = Math.min(innerW, innerH);
       const ledW = rot === 90 ? ledModel.height : ledModel.width;
       const ledH = rot === 90 ? ledModel.width : ledModel.height;
       const ledRef = Math.max(ledW, ledH);
-      pitch = Math.min(ledRef, thickness * 0.9);
+      pitchBase = Math.min(ledRef, Math.min(W, H) * 0.9);
     }
-    if (pitch <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0 };
-    const ledsX = Math.floor(innerW / pitch);
-    const ledsY = Math.floor(innerH / pitch);
-    return { ledsX: Math.max(0, ledsX), ledsY: Math.max(0, ledsY), totalLeds: Math.max(0, ledsX) * Math.max(0, ledsY), pitch };
+    if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
+    const ledsX = Math.max(1, Math.floor(W / pitchBase));
+    const ledsY = Math.max(1, Math.floor(H / pitchBase));
+    const pitchX = W / ledsX;
+    const pitchY = H / ledsY;
+    return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch: pitchBase, pitchX, pitchY };
   };
 
   const r0 = calcForRotation(0);
   const r90 = calcForRotation(90);
-  // Auto-pick best rotation unless explicit preference and it's not worse
-  const preferred = ledRotation === 0 ? r0 : r90;
-  const other = ledRotation === 0 ? r90 : r0;
-  return other.totalLeds > preferred.totalLeds ? other : preferred;
+  return r90.totalLeds > r0.totalLeds ? r90 : r0;
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────
@@ -666,7 +651,7 @@ function LedDrawingCanvas({
         // No border margin indicator needed
 
         if (ledModel) {
-          const { positions, totalLeds, pitch, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
 
           // LED dims with auto-selected rotation
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
@@ -703,7 +688,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · pitch ${pitch.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
 
           // LED name badge
           ctx.fillStyle = "#a855f7";
@@ -752,7 +737,7 @@ function LedDrawingCanvas({
         ctx.strokeRect(ox, oy, pw, ph);
 
         if (ledModel) {
-          const { totalLeds, pitch } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+          const { totalLeds, pitchX, pitchY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
@@ -762,7 +747,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · pitch ${pitch.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
         }
       }
     });
@@ -1147,21 +1132,21 @@ export default function NestingApp() {
     const rows = groups.map((g) => {
       const assignedId = ledAssignments[g.key] ?? selectedLedId;
       const ledModel = ledModels.find((l) => l.id === assignedId) ?? null;
-      if (!ledModel) return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: 0, ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, totalPower: 0, ledName: "–" };
+      if (!ledModel) return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: 0, ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, totalPower: 0, ledName: "–" };
 
       const poly = g.parts[0]?.outer ?? [];
       const holes = g.parts[0]?.holes ?? [];
-      let totalLeds = 0, pitch = 0;
+      let totalLeds = 0, pitch = 0, pitchX = 0, pitchY = 0;
       if (poly.length) {
         const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
-        totalLeds = r.totalLeds; pitch = r.pitch;
+        totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       } else {
         const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
-        totalLeds = r.totalLeds; pitch = r.pitch;
+        totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       }
       const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
       const totalPower = totalLeds * ledModel.power * g.quantity;
-      return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, totalPower, ledName: ledModel.name };
+      return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, pitchX, pitchY, totalPower, ledName: ledModel.name };
     });
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
@@ -1296,7 +1281,7 @@ export default function NestingApp() {
                       </SelectContent>
                     </Select>
                   </div>
-                  {ledNeedsUpdate && selectedLedId && (
+                  {selectedLedId && (
                     <Button
                       onClick={handleUpdateLed}
                       variant="outline"
@@ -1482,7 +1467,7 @@ export default function NestingApp() {
                           ))}
                         </SelectContent>
                       </Select>
-                      {ledNeedsUpdate && selectedLedId && (
+                      {selectedLedId && (
                         <Button onClick={handleUpdateLed} variant="outline" className="h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10 whitespace-nowrap">
                           <RefreshCw className="h-3.5 w-3.5 mr-1" /> Atualizar
                         </Button>
@@ -1498,15 +1483,18 @@ export default function NestingApp() {
                       {letterHeight && letterHeight > 0 ? (
                         <>
                           <span className="text-yellow-400">altura_letra</span> = {letterHeight} mm<br />
-                          <span className="text-orange-400">pitch</span> = {letterHeight} × 0,85 = <strong className="text-white">{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong> (largura e altura)<br />
+                          <span className="text-orange-400">pitch_base</span> = {letterHeight} × 0,85 = <strong className="text-white">{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong><br />
+                          <span className="text-cyan-400">nCols</span> = floor(largura ÷ pitch_base) &nbsp;|&nbsp; <span className="text-cyan-400">nRows</span> = floor(altura ÷ pitch_base)<br />
+                          <span className="text-green-400">↔ pitchX</span> = largura ÷ nCols &nbsp;(espaçamento real no comprimento)<br />
+                          <span className="text-green-400">↕ pitchY</span> = altura ÷ nRows &nbsp;(espaçamento real na altura)<br />
                           <span className="text-purple-400">posições</span> = filtradas pela forma real do polígono
                         </>
                       ) : (
                         <>
-                          <span className="text-blue-400">espessura</span> = min(larg, alt)<br />
-                          <span className="text-yellow-400">pitch_máx</span> = espessura × 0,9<br />
+                          <span className="text-blue-400">pitch_base</span> = min(LED_ref, espessura × 0,9)<br />
                           <span className="text-green-400">LED_ref</span> = max({selectedLed.width}, {selectedLed.height}) = {Math.max(selectedLed.width, selectedLed.height)} mm<br />
-                          <span className="text-orange-400">pitch_final</span> = min(LED_ref, pitch_máx)<br />
+                          <span className="text-cyan-400">nCols</span> = floor(larg ÷ pitch_base) &nbsp;|&nbsp; <span className="text-cyan-400">nRows</span> = floor(alt ÷ pitch_base)<br />
+                          <span className="text-green-400">↔ pitchX</span> = largura ÷ nCols &nbsp;|&nbsp; <span className="text-green-400">↕ pitchY</span> = altura ÷ nRows<br />
                           <span className="text-purple-400">posições</span> = filtradas pela forma real do polígono
                         </>
                       )}
@@ -1601,11 +1589,9 @@ export default function NestingApp() {
                       <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
                         <Zap className="h-3.5 w-3.5 text-yellow-400" /> Desenho de Posicionamento para Produção
                       </h3>
-                      {ledNeedsUpdate && (
-                        <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-7 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
-                          <RefreshCw className="h-3 w-3 mr-1" /> Atualizar
-                        </Button>
-                      )}
+                      <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-7 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
+                        <RefreshCw className="h-3 w-3 mr-1" /> Atualizar
+                      </Button>
                     </div>
                     <p className="text-xs text-muted-foreground mb-3">
                       Retângulos amarelos = LEDs em tamanho real · posições filtradas pela forma da peça · giro automático
@@ -1634,7 +1620,8 @@ export default function NestingApp() {
                               <th className="px-4 py-2 text-left font-medium text-muted-foreground">Dimensões (mm)</th>
                               <th className="px-4 py-2 text-left font-medium text-muted-foreground">LED</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Qtd</th>
-                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">Pitch (mm)</th>
+                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">↔ PitchX (mm)</th>
+                              <th className="px-4 py-2 text-right font-medium text-muted-foreground">↕ PitchY (mm)</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">LEDs/peça</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Total LEDs</th>
                               <th className="px-4 py-2 text-right font-medium text-muted-foreground">Potência (W)</th>
@@ -1646,7 +1633,8 @@ export default function NestingApp() {
                                 <td className="px-4 py-2 font-mono">{row.width.toFixed(0)} × {row.height.toFixed(0)}</td>
                                 <td className="px-4 py-2 text-purple-300 text-[11px]">{row.ledName}</td>
                                 <td className="px-4 py-2 text-right">{row.qty}</td>
-                                <td className="px-4 py-2 text-right text-blue-400">{row.pitch.toFixed(1)}</td>
+                                <td className="px-4 py-2 text-right text-cyan-400">{row.pitchX?.toFixed(1) ?? row.pitch.toFixed(1)}</td>
+                                <td className="px-4 py-2 text-right text-cyan-400">{row.pitchY?.toFixed(1) ?? row.pitch.toFixed(1)}</td>
                                 <td className="px-4 py-2 text-right text-yellow-400 font-medium">{row.ledsPerPiece}</td>
                                 <td className="px-4 py-2 text-right font-bold">{row.totalLeds}</td>
                                 <td className="px-4 py-2 text-right text-orange-400">{row.totalPower.toFixed(1)}</td>
@@ -1655,7 +1643,7 @@ export default function NestingApp() {
                           </tbody>
                           <tfoot>
                             <tr className="bg-background font-semibold">
-                              <td className="px-4 py-2 text-muted-foreground" colSpan={5}>TOTAL</td>
+                              <td className="px-4 py-2 text-muted-foreground" colSpan={6}>TOTAL</td>
                               <td className="px-4 py-2 text-right text-yellow-400 text-sm">{ledSummary.totalLeds.toLocaleString("pt-BR")}</td>
                               <td className="px-4 py-2 text-right text-orange-400">{ledSummary.totalPower.toFixed(1)}</td>
                             </tr>
