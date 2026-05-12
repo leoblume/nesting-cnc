@@ -445,35 +445,8 @@ function renderSheet(
       ctx.fillText(part.mirrored ? `M${part.rotation}°` : `${part.rotation}°`, cx, cy);
     }
 
-    // Draw LEDs following actual polygon shape
-    if (showLeds && ledModel) {
-      const { positions, totalLeds, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, 0, letterHeight, ledRotation);
-
-      // LED physical size in screen pixels (use auto-selected rotation)
-      const rawW = partRot === 90 ? ledModel.height : ledModel.width;
-      const rawH = partRot === 90 ? ledModel.width : ledModel.height;
-      const ledW = Math.max(2, rawW * scale);
-      const ledH = Math.max(2, rawH * scale);
-
-      for (const pos of positions) {
-        const lx = pos.x * scale;
-        const ly = pos.y * scale;
-        ctx.fillStyle = "#fde68a";
-        ctx.strokeStyle = "#f59e0b";
-        ctx.lineWidth = 0.5;
-        ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
-        ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
-      }
-
-      const labelX = (part.bbox.minX + part.bbox.maxX) / 2 * scale;
-      const labelY = part.bbox.maxY * scale + 4;
-      const labelSz = Math.max(7, Math.min(10, (part.bbox.maxX - part.bbox.minX) * scale / 6));
-      ctx.font = `bold ${labelSz}px monospace`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      ctx.fillStyle = "#fde68a";
-      ctx.fillText(`${totalLeds} LEDs`, labelX, labelY);
-    }
+    // LEDs are NOT drawn on the cut plan sheet (only in the LED positioning tab)
+    void showLeds; void ledModel; void letterHeight; void ledRotation;
   }
 
   // Leftover area
@@ -924,6 +897,7 @@ function printPlan(
   groups: ReturnType<typeof groupParts>,
   ledSummary: { rows: any[]; totalLeds: number; totalPower: number } | null,
   fileName: string,
+  ledEngine: LedEngine = "centerline",
 ) {
   const win = window.open("", "_blank", "width=1200,height=900");
   if (!win) { alert("Permita popups para imprimir."); return; }
@@ -961,7 +935,7 @@ function printPlan(
       let totalLeds = 0, pitch = 0;
       if (ledModel) {
         if (poly.length) {
-          const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+          const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
           totalLeds = r.totalLeds; pitch = r.pitch;
         } else {
           const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
@@ -1003,7 +977,7 @@ function printPlan(
         }
 
         if (ledModel) {
-          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
+          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
           const rawH = partRot === 90 ? ledModel.width : ledModel.height;
           const ledW = Math.max(1.5, rawW * S);
@@ -1330,7 +1304,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 9.1</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 10</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1410,7 +1384,7 @@ export default function NestingApp() {
             <Button
               variant="outline"
               className="w-full border-slate-600 text-slate-300 hover:bg-slate-800 hover:text-white"
-              onClick={() => printPlan(result, opts, ledModels, selectedLedId, ledAssignments, showLeds, 0, letterHeight, 0, groups, ledSummary, fileName || "sem-nome.pdf")}
+              onClick={() => printPlan(result, opts, ledModels, selectedLedId, ledAssignments, showLeds, 0, letterHeight, 0, groups, ledSummary, fileName || "sem-nome.pdf", ledEngine)}
             >
               <Printer className="mr-2 h-4 w-4" /> Imprimir Plano de Corte
             </Button>
@@ -1428,7 +1402,7 @@ export default function NestingApp() {
                 <div className="flex flex-col gap-2">
                   <div className="flex flex-col gap-1">
                     <Label className="text-xs text-muted-foreground">Modelo ativo</Label>
-                    <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); }}>
+                    <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); setRenderedLedId(v); setLedKey((k) => k + 1); }}>
                       <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
                       <SelectContent>
                         {ledModels.map((l) => (
@@ -1633,7 +1607,7 @@ export default function NestingApp() {
                     <p className="text-xs text-muted-foreground italic">Cadastre um LED na aba "Cadastro LED"</p>
                   ) : (
                     <div className="flex gap-2">
-                      <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); }}>
+                      <Select value={selectedLedId ?? ""} onValueChange={(v) => { setSelectedLedId(v); setRenderedLedId(v); setLedKey((k) => k + 1); }}>
                         <SelectTrigger className="h-7 text-xs flex-1"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
                         <SelectContent>
                           {ledModels.map((l) => (
@@ -1641,11 +1615,6 @@ export default function NestingApp() {
                           ))}
                         </SelectContent>
                       </Select>
-                      {selectedLedId && (
-                        <Button onClick={handleUpdateLed} variant="outline" className="h-7 text-[10px] border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10 px-2">
-                          <RefreshCw className="h-3 w-3" />
-                        </Button>
-                      )}
                     </div>
                   )}
                 </div>
