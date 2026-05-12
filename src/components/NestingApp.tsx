@@ -104,7 +104,20 @@ export type LedEngine = "grid" | "centerline";
 const DEFAULT_THICKNESS_MM = 50; // espessura padrão quando não informada
 
 function calcPitchFromLetterHeight(letterHeight: number): number {
-  return letterHeight * 0.85;
+  // nova regra v10:
+  // distância entre LEDs = metade da espessura
+  // mínimo absoluto = 50mm
+  return Math.max(letterHeight / 2, DEFAULT_THICKNESS_MM);
+}
+
+function calcAdaptivePitch(thickness: number, area: number): number {
+  let pitch = Math.max(thickness / 2, DEFAULT_THICKNESS_MM);
+
+  // peças pequenas recebem menos LEDs
+  if (area < 10000) pitch *= 1.15;
+  if (thickness < 100) pitch *= 1.1;
+
+  return pitch;
 }
 
 // ── GRID ENGINE ───────────────────────────────────────────────────────────────
@@ -130,12 +143,9 @@ function calcLedsGrid(
   if (letterHeight && letterHeight > 0) {
     pitchBase = calcPitchFromLetterHeight(letterHeight);
   } else {
-    const ledW = rotation === 90 ? ledModel.height : ledModel.width;
-    const ledH = rotation === 90 ? ledModel.width : ledModel.height;
-    const ledRef = Math.max(ledW, ledH);
     const thickness = Math.min(innerW, innerH);
     const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-    pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
+    pitchBase = calcAdaptivePitch(effectiveThickness, innerW * innerH);
   }
   if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
@@ -191,9 +201,8 @@ function calcLedsCenterline(
   if (letterHeight && letterHeight > 0) {
     pitch = calcPitchFromLetterHeight(letterHeight);
   } else {
-    const ledRef = Math.max(ledModel.width, ledModel.height);
-    pitch = Math.min(ledRef, estimatedThickness * 0.9);
-    if (pitch <= 0) pitch = ledRef > 0 ? ledRef : DEFAULT_THICKNESS_MM * 0.7;
+    pitch = calcAdaptivePitch(estimatedThickness, W * H);
+    if (pitch <= 0) pitch = DEFAULT_THICKNESS_MM;
   }
 
   // Detecta direção principal: mais longo eixo
@@ -332,12 +341,9 @@ function calcLedsForBbox(
     if (letterHeight && letterHeight > 0) {
       pitchBase = calcPitchFromLetterHeight(letterHeight);
     } else {
-      const ledW = rot === 90 ? ledModel.height : ledModel.width;
-      const ledH = rot === 90 ? ledModel.width : ledModel.height;
-      const ledRef = Math.max(ledW, ledH);
       const thickness = Math.min(W, H);
       const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-      pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
+      pitchBase = calcAdaptivePitch(effectiveThickness, W * H);
     }
     if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
     const ledsX = Math.max(1, Math.floor(W / pitchBase));
