@@ -15,6 +15,14 @@ import { runNesting, type NestResult, type PlacedPart, type NestingOptions } fro
 import { type Point } from "@/lib/nesting/geometry";
 import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw, Printer } from "lucide-react";
 
+// ─── Versão ───────────────────────────────────────────────────────────────────
+const APP_VERSION = "10";
+
+// ─── Terminologia de eixos (convenção única em todo o arquivo) ─────────────
+//   Largura  → eixo X → dimensão horizontal
+//   Altura   → eixo Y → dimensão vertical
+//   Espessura → eixo Z → profundidade / espessura da letra (padrão 50 mm)
+
 const PART_COLORS = [
   "#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6",
   "#06b6d4","#f97316","#84cc16","#ec4899","#14b8a6",
@@ -31,14 +39,29 @@ function getColor(sig: string, idx: number): string {
 export interface LedModel {
   id: string;
   name: string;
-  width: number;   // mm
-  height: number;  // mm
-  power: number;   // W per unit
+  /** Largura visual do LED (eixo X), mm */
+  widthMm: number;
+  /** Altura visual do LED (eixo Y), mm */
+  heightMm: number;
+  power: number;   // W por unidade
   photoUrl?: string;
 }
 
+/** Desconto de respiro para cálculo de aproveitamento.
+ *  O LED tem tamanho visual (widthMm × heightMm).
+ *  Para fins de cálculo subtraímos: 2 mm na largura (X) e 1 mm na altura (Y).
+ */
+function ledCalcDims(led: LedModel, rotation: 0 | 90 = 0): { calcW: number; calcH: number } {
+  const MARGIN_X = 2; // mm descontados da largura para cálculo
+  const MARGIN_Y = 1; // mm descontados da altura para cálculo
+  if (rotation === 90) {
+    // girado: largura-de-cálculo vira o que era altura visual, altura-de-cálculo vira o que era largura visual
+    return { calcW: Math.max(1, led.heightMm - MARGIN_Y), calcH: Math.max(1, led.widthMm - MARGIN_X) };
+  }
+  return { calcW: Math.max(1, led.widthMm - MARGIN_X), calcH: Math.max(1, led.heightMm - MARGIN_Y) };
+}
+
 // ─── LED Assignment per part group ────────────────────────────────────────
-// Maps groupKey -> ledModelId (or null = use global selected)
 type LedAssignment = Record<string, string>;
 
 // ─── Point-in-polygon test ─────────────────────────────────────────────────
@@ -54,57 +77,46 @@ function pointInPoly(pt: Point, poly: Point[]): boolean {
   return inside;
 }
 
-// ─── Improved shrink polygon (offset inward along normals) ────────────────
+// ─── Shrink polygon (offset inward along normals) ─────────────────────────
 function shrinkPolygon(poly: Point[], margin: number): Point[] {
   const n = poly.length;
   if (n < 3) return poly;
-
-  // Compute centroid
   let cx = 0, cy = 0;
   for (const p of poly) { cx += p.x; cy += p.y; }
   cx /= n; cy /= n;
-
-  // For each vertex, compute the bisector of the two adjacent edge normals
   const result: Point[] = [];
   for (let i = 0; i < n; i++) {
     const prev = poly[(i - 1 + n) % n];
     const curr = poly[i];
     const next = poly[(i + 1) % n];
-
-    // Edge vectors
     const e1x = curr.x - prev.x, e1y = curr.y - prev.y;
     const e2x = next.x - curr.x, e2y = next.y - curr.y;
-
-    // Inward normals (perpendicular, pointing toward centroid)
     const len1 = Math.hypot(e1x, e1y) || 1;
     const len2 = Math.hypot(e2x, e2y) || 1;
     let n1x = -e1y / len1, n1y = e1x / len1;
     let n2x = -e2y / len2, n2y = e2x / len2;
-
-    // Ensure normals point inward
     if (n1x * (cx - curr.x) + n1y * (cy - curr.y) < 0) { n1x = -n1x; n1y = -n1y; }
     if (n2x * (cx - curr.x) + n2y * (cy - curr.y) < 0) { n2x = -n2x; n2y = -n2y; }
-
-    // Bisector
     let bx = n1x + n2x, by = n1y + n2y;
     const blen = Math.hypot(bx, by) || 1;
     bx /= blen; by /= blen;
-
     result.push({ x: curr.x + bx * margin, y: curr.y + by * margin });
   }
   return result;
 }
 
-// ─── LED Calculation Engine ────────────────────────────────────────────────────
-// Motor A: GRID  — grade uniforme filtrada pela forma
-// Motor B: CENTERLINE — LEDs ao longo da linha central (esqueleto) da peça
-
+// ─── LED Calculation Engine ────────────────────────────────────────────────
 export type LedEngine = "grid" | "centerline";
 
-const DEFAULT_THICKNESS_MM = 50; // espessura padrão quando não informada
+/** Espessura padrão do eixo Z (profundidade da letra), em mm */
+const DEFAULT_LETTER_THICKNESS_MM = 50;
 
-function calcPitchFromLetterHeight(letterHeight: number): number {
-  return letterHeight * 0.85;
+/**
+ * Distância entre módulos LED = espessura da letra × (1 - 15%) = espessura × 0.85
+ * Aplica na direção X e na direção Y (pitch uniforme).
+ */
+function calcPitchFromLetterThickness(letterThicknessMm: number): number {
+  return letterThicknessMm * 0.85;
 }
 
 // ── GRID ENGINE ───────────────────────────────────────────────────────────────
@@ -112,43 +124,52 @@ function calcLedsGrid(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  letterHeight: number | null,
+  letterThicknessMm: number | null,
   rotation: 0 | 90,
 ): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
   if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
+  // Bounding box da peça
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of polygon) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
+  // innerW = largura (eixo X), innerH = altura (eixo Y)
   const innerW = maxX - minX;
   const innerH = maxY - minY;
   if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  let pitchBase: number;
-  if (letterHeight && letterHeight > 0) {
-    pitchBase = calcPitchFromLetterHeight(letterHeight);
-  } else {
-    const ledW = rotation === 90 ? ledModel.height : ledModel.width;
-    const ledH = rotation === 90 ? ledModel.width : ledModel.height;
-    const ledRef = Math.max(ledW, ledH);
-    const thickness = Math.min(innerW, innerH);
-    const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-    pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
-  }
-  if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+  // Dimensões de cálculo do LED (com margem de respiro aplicada)
+  const { calcW: ledCalcW, calcH: ledCalcH } = ledCalcDims(ledModel, rotation);
 
-  const cols = Math.max(1, Math.floor(innerW / pitchBase));
-  const rows = Math.max(1, Math.floor(innerH / pitchBase));
-  const pitchX = innerW / cols;
-  const pitchY = innerH / rows;
+  let pitchX: number;
+  let pitchY: number;
+
+  if (letterThicknessMm && letterThicknessMm > 0) {
+    // Pitch derivado da espessura da letra (eixo Z), aplicado em X e Y
+    const p = calcPitchFromLetterThickness(letterThicknessMm);
+    pitchX = p;
+    pitchY = p;
+  } else {
+    // Sem letra definida: pitch = dimensão de cálculo do LED em cada eixo
+    pitchX = ledCalcW;
+    pitchY = ledCalcH;
+  }
+
+  if (pitchX <= 0 || pitchY <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+
+  // Garante ao menos 1 coluna e 1 linha mesmo em espaços pequenos
+  const cols = Math.max(1, Math.floor(innerW / pitchX));
+  const rows = Math.max(1, Math.floor(innerH / pitchY));
+  const actualPitchX = innerW / cols;
+  const actualPitchY = innerH / rows;
 
   const positions: Array<{ x: number; y: number }> = [];
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      const x = minX + (col + 0.5) * pitchX;
-      const y = minY + (row + 0.5) * pitchY;
+      const x = minX + (col + 0.5) * actualPitchX;
+      const y = minY + (row + 0.5) * actualPitchY;
       const pt = { x, y };
       if (!pointInPoly(pt, polygon)) continue;
       let inHole = false;
@@ -157,49 +178,44 @@ function calcLedsGrid(
       positions.push({ x, y });
     }
   }
-  return { totalLeds: positions.length, pitch: pitchBase, pitchX, pitchY, positions };
+  return { totalLeds: positions.length, pitch: Math.max(actualPitchX, actualPitchY), pitchX: actualPitchX, pitchY: actualPitchY, positions };
 }
 
 // ── CENTERLINE ENGINE ─────────────────────────────────────────────────────────
-// Princípio: para cada scanline perpendicular à direção principal, encontra os
-// dois bordas do polígono e coloca o LED no ponto médio (linha central).
-// Assim os LEDs seguem o esqueleto da forma, como na Figura 2.
+/**
+ * Linha central: scanlines perpendiculares à direção principal.
+ * Suporta múltiplas linhas paralelas ao centro (numLines > 1).
+ * O número de linhas de LEDs é calculado com base na espessura disponível vs. tamanho do LED.
+ */
 function calcLedsCenterline(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  letterHeight: number | null,
-): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
-  if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+  letterThicknessMm: number | null,
+  numLinesOverride?: number, // se fornecido, usa este número de linhas
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; numLines: number } {
+  if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], numLines: 1 };
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of polygon) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
-  const W = maxX - minX;
-  const H = maxY - minY;
-  if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+  const W = maxX - minX; // largura X
+  const H = maxY - minY; // altura Y
+  if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], numLines: 1 };
 
-  // Determina espessura média do objeto (dimensão menor do bbox)
-  const estimatedThickness = letterHeight && letterHeight > 0
-    ? letterHeight
-    : Math.min(W, H) > 0 ? Math.min(W, H) : DEFAULT_THICKNESS_MM;
+  const thickness = letterThicknessMm && letterThicknessMm > 0 ? letterThicknessMm : DEFAULT_LETTER_THICKNESS_MM;
+  const pitch = calcPitchFromLetterThickness(thickness);
 
-  // Pitch ao longo do comprimento principal
-  let pitch: number;
-  if (letterHeight && letterHeight > 0) {
-    pitch = calcPitchFromLetterHeight(letterHeight);
-  } else {
-    const ledRef = Math.max(ledModel.width, ledModel.height);
-    pitch = Math.min(ledRef, estimatedThickness * 0.9);
-    if (pitch <= 0) pitch = ledRef > 0 ? ledRef : DEFAULT_THICKNESS_MM * 0.7;
-  }
+  // Dimensões de cálculo do LED (com margem de respiro)
+  const { calcW: ledCalcW, calcH: ledCalcH } = ledCalcDims(ledModel, 0);
+  const ledRef = Math.min(ledCalcW, ledCalcH); // menor dimensão para caber na espessura
 
-  // Detecta direção principal: mais longo eixo
-  const alongX = W >= H; // varre ao longo de X se o objeto é mais horizontal
+  // Direção principal: eixo mais longo
+  const alongX = W >= H;
 
-  // Função auxiliar: interseções de scanline horizontal (y=ty) com o polígono
+  // scanline helpers
   function scanlineX(ty: number, poly: Point[]): number[] {
     const xs: number[] = [];
     for (let i = 0, n = poly.length; i < n; i++) {
@@ -212,7 +228,6 @@ function calcLedsCenterline(
     return xs.sort((a, b) => a - b);
   }
 
-  // Função auxiliar: interseções de scanline vertical (x=tx) com o polígono
   function scanlineY(tx: number, poly: Point[]): number[] {
     const ys: number[] = [];
     for (let i = 0, n = poly.length; i < n; i++) {
@@ -225,31 +240,52 @@ function calcLedsCenterline(
     return ys.sort((a, b) => a - b);
   }
 
+  // Calcula quantas linhas de LED cabem na dimensão transversal
+  // Dimensão transversal = a dimensão menor (perpendicular ao comprimento principal)
+  const transversal = alongX ? H : W;
+  let numLines: number;
+  if (numLinesOverride !== undefined && numLinesOverride >= 1) {
+    numLines = numLinesOverride;
+  } else {
+    // Calcula automaticamente: quantas linhas de LED (com pitch transversal) cabem
+    numLines = Math.max(1, Math.floor(transversal / (ledRef > 0 ? ledRef : pitch)));
+  }
+
+  // Offsets transversais das linhas relativas ao centro (0 = linha central)
+  const lineOffsets: number[] = [];
+  if (numLines === 1) {
+    lineOffsets.push(0);
+  } else {
+    const transStep = transversal / numLines;
+    for (let l = 0; l < numLines; l++) {
+      lineOffsets.push(-transversal / 2 + transStep * (l + 0.5));
+    }
+  }
+
   const positions: Array<{ x: number; y: number }> = [];
 
   if (alongX) {
-    // Varre X com passo = pitch; para cada X, encontra a linha central em Y
+    // Varre X com passo = pitch; para cada X, encontra a linha central em Y e aplica offsets
     const steps = Math.max(1, Math.round(W / pitch));
     const actualPitch = W / steps;
     for (let i = 0; i < steps; i++) {
       const tx = minX + (i + 0.5) * actualPitch;
       const ys = scanlineY(tx, polygon);
       if (ys.length < 2) continue;
-      // Para cada par de bordas: ponto médio = linha central
       for (let j = 0; j + 1 < ys.length; j += 2) {
         const yMid = (ys[j] + ys[j + 1]) / 2;
-        const pt = { x: tx, y: yMid };
-        // Verifica que não está em buraco
-        let inHole = false;
-        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
-        if (!inHole) positions.push(pt);
+        for (const offset of lineOffsets) {
+          const pt = { x: tx, y: yMid + offset };
+          if (!pointInPoly(pt, polygon)) continue;
+          let inHole = false;
+          for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
+          if (!inHole) positions.push(pt);
+        }
       }
     }
-    const pitchX = steps > 0 ? W / steps : pitch;
-    const pitchY = pitch;
-    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
+    return { totalLeds: positions.length, pitch, pitchX: W / steps, pitchY: transversal / numLines, positions, numLines };
   } else {
-    // Varre Y com passo = pitch; para cada Y, linha central em X
+    // Varre Y com passo = pitch; para cada Y, linha central em X e aplica offsets
     const steps = Math.max(1, Math.round(H / pitch));
     const actualPitch = H / steps;
     for (let i = 0; i < steps; i++) {
@@ -258,93 +294,83 @@ function calcLedsCenterline(
       if (xs.length < 2) continue;
       for (let j = 0; j + 1 < xs.length; j += 2) {
         const xMid = (xs[j] + xs[j + 1]) / 2;
-        const pt = { x: xMid, y: ty };
-        let inHole = false;
-        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
-        if (!inHole) positions.push(pt);
+        for (const offset of lineOffsets) {
+          const pt = { x: xMid + offset, y: ty };
+          if (!pointInPoly(pt, polygon)) continue;
+          let inHole = false;
+          for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
+          if (!inHole) positions.push(pt);
+        }
       }
     }
-    const pitchX = pitch;
-    const pitchY = steps > 0 ? H / steps : pitch;
-    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
+    return { totalLeds: positions.length, pitch, pitchX: transversal / numLines, pitchY: H / steps, positions, numLines };
   }
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
-function calcLedsForPartWithRotation(
-  polygon: Point[],
-  holes: Point[][],
-  ledModel: LedModel,
-  _borderMargin: number,
-  letterHeight: number | null,
-  rotation: 0 | 90,
-  engine: LedEngine = "centerline",
-): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
-  if (engine === "centerline") {
-    return calcLedsCenterline(polygon, holes, ledModel, letterHeight);
-  }
-  return calcLedsGrid(polygon, holes, ledModel, letterHeight, rotation);
-}
-
 function calcLedsForPart(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  borderMargin = 0,
-  letterHeight: number | null = null,
-  ledRotation: 0 | 90 = 0,
+  letterThicknessMm: number | null = null,
   engine: LedEngine = "centerline",
-): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
-  if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: ledRotation };
+  numCenterlines?: number,
+): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90; numLines: number } {
+  if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0, numLines: 1 };
 
   if (engine === "centerline") {
-    const r = calcLedsCenterline(polygon, holes, ledModel, letterHeight);
+    const r = calcLedsCenterline(polygon, holes, ledModel, letterThicknessMm, numCenterlines);
     return { ...r, bestRotation: 0 };
   }
 
-  const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0, "grid");
-  const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90, "grid");
+  // Grid: testa rotação 0° e 90°, escolhe a que dá mais LEDs
+  const r0 = calcLedsGrid(polygon, holes, ledModel, letterThicknessMm, 0);
+  const r90 = calcLedsGrid(polygon, holes, ledModel, letterThicknessMm, 90);
 
   if (r0.totalLeds === 0 && r90.totalLeds === 0) {
-    return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0 };
+    return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0, numLines: 1 };
   }
 
   const best = r90.totalLeds > r0.totalLeds ? r90 : r0;
   const bestRotation: 0 | 90 = r90.totalLeds > r0.totalLeds ? 90 : 0;
-  return { ...best, bestRotation };
+  return { ...best, bestRotation, numLines: 1 };
 }
 
-// Aproximação bbox (para sumário e tabela)
+/**
+ * Cálculo de aproveitamento por bbox (para tabela resumo).
+ * Usa dimensões reais do LED menos margem de respiro.
+ */
 function calcLedsForBbox(
-  partWidth: number,
-  partHeight: number,
+  /** Largura da peça (eixo X), mm */
+  partWidthMm: number,
+  /** Altura da peça (eixo Y), mm */
+  partHeightMm: number,
   ledModel: LedModel,
-  borderMargin = 0,
-  letterHeight: number | null = null,
-  ledRotation: 0 | 90 = 0,
+  letterThicknessMm: number | null = null,
 ): { ledsX: number; ledsY: number; totalLeds: number; pitch: number; pitchX: number; pitchY: number } {
-  const W = partWidth;
-  const H = partHeight;
+  const W = partWidthMm;
+  const H = partHeightMm;
   if (W <= 0 || H <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
 
   const calcForRotation = (rot: 0 | 90) => {
-    let pitchBase: number;
-    if (letterHeight && letterHeight > 0) {
-      pitchBase = calcPitchFromLetterHeight(letterHeight);
+    const { calcW: ledCalcW, calcH: ledCalcH } = ledCalcDims(ledModel, rot);
+    let pitchX: number;
+    let pitchY: number;
+    if (letterThicknessMm && letterThicknessMm > 0) {
+      const p = calcPitchFromLetterThickness(letterThicknessMm);
+      pitchX = p;
+      pitchY = p;
     } else {
-      const ledW = rot === 90 ? ledModel.height : ledModel.width;
-      const ledH = rot === 90 ? ledModel.width : ledModel.height;
-      const ledRef = Math.max(ledW, ledH);
-      const thickness = Math.min(W, H);
-      const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-      pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
+      pitchX = ledCalcW;
+      pitchY = ledCalcH;
     }
-    if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
-    const ledsX = Math.max(1, Math.floor(W / pitchBase));
-    const ledsY = Math.max(1, Math.floor(H / pitchBase));
-    const pitchX = W / ledsX;
-    const pitchY = H / ledsY;
-    return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch: pitchBase, pitchX, pitchY };
+    if (pitchX <= 0 || pitchY <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
+    // Ao menos 1 em cada eixo
+    const ledsX = Math.max(1, Math.floor(W / pitchX));
+    const ledsY = Math.max(1, Math.floor(H / pitchY));
+    const actualPX = W / ledsX;
+    const actualPY = H / ledsY;
+    return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch: Math.max(actualPX, actualPY), pitchX: actualPX, pitchY: actualPY };
   };
 
   const r0 = calcForRotation(0);
@@ -352,7 +378,7 @@ function calcLedsForBbox(
   return r90.totalLeds > r0.totalLeds ? r90 : r0;
 }
 
-// ─── Canvas rendering ─────────────────────────────────────────────────────
+// ─── Canvas rendering (plano de nesting) ────────────────────────────────────
 function renderSheet(
   canvas: HTMLCanvasElement,
   placed: PlacedPart[],
@@ -361,9 +387,7 @@ function renderSheet(
   margin: number,
   ledModel: LedModel | null,
   showLeds: boolean,
-  borderMargin: number,
-  letterHeight: number | null = null,
-  ledRotation: 0 | 90 = 0,
+  letterThicknessMm: number | null = null,
 ) {
   const dpr = window.devicePixelRatio || 1;
   const container = canvas.parentElement!;
@@ -445,13 +469,12 @@ function renderSheet(
       ctx.fillText(part.mirrored ? `M${part.rotation}°` : `${part.rotation}°`, cx, cy);
     }
 
-    // Draw LEDs following actual polygon shape
+    // LEDs no nesting: usa dimensões visuais reais do LED
     if (showLeds && ledModel) {
-      const { positions, totalLeds, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, 0, letterHeight, ledRotation);
-
-      // LED physical size in screen pixels (use auto-selected rotation)
-      const rawW = partRot === 90 ? ledModel.height : ledModel.width;
-      const rawH = partRot === 90 ? ledModel.width : ledModel.height;
+      const { positions, bestRotation: partRot } = calcLedsForPart(part.polygon, part.holes, ledModel, letterThicknessMm, "centerline");
+      // Tamanho visual real do LED na tela (não subtraímos margem aqui, exibição real)
+      const rawW = partRot === 90 ? ledModel.heightMm : ledModel.widthMm;
+      const rawH = partRot === 90 ? ledModel.widthMm : ledModel.heightMm;
       const ledW = Math.max(2, rawW * scale);
       const ledH = Math.max(2, rawH * scale);
 
@@ -472,11 +495,11 @@ function renderSheet(
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       ctx.fillStyle = "#fde68a";
-      ctx.fillText(`${totalLeds} LEDs`, labelX, labelY);
+      ctx.fillText(`${positions.length} LEDs`, labelX, labelY);
     }
   }
 
-  // Leftover area
+  // Sobra útil (área não usada)
   if (placed.length > 0) {
     const leftoverW = sheetWidth - maxX - margin;
     const leftoverH = sheetHeight - 2 * margin;
@@ -516,11 +539,7 @@ function NumericField({ label, unit, value, onChange, min = 0, step = 1 }: {
 
 // ─── LED Registration Panel ────────────────────────────────────────────────
 function LedRegistrationPanel({
-  leds,
-  onAdd,
-  onRemove,
-  selectedId,
-  onSelect,
+  leds, onAdd, onRemove, selectedId, onSelect,
 }: {
   leds: LedModel[];
   onAdd: (m: LedModel) => void;
@@ -528,7 +547,7 @@ function LedRegistrationPanel({
   selectedId: string | null;
   onSelect: (id: string) => void;
 }) {
-  const [form, setForm] = useState({ name: "", width: 5, height: 5, power: 0.5 });
+  const [form, setForm] = useState({ name: "", widthMm: 5, heightMm: 5, power: 0.5 });
   const [photoUrl, setPhotoUrl] = useState<string | undefined>();
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -545,12 +564,12 @@ function LedRegistrationPanel({
     onAdd({
       id: `led-${Date.now()}`,
       name: form.name.trim(),
-      width: form.width,
-      height: form.height,
+      widthMm: form.widthMm,
+      heightMm: form.heightMm,
       power: form.power,
       photoUrl,
     });
-    setForm({ name: "", width: 5, height: 5, power: 0.5 });
+    setForm({ name: "", widthMm: 5, heightMm: 5, power: 0.5 });
     setPhotoUrl(undefined);
     if (fileRef.current) fileRef.current.value = "";
   };
@@ -560,40 +579,43 @@ function LedRegistrationPanel({
       {leds.length > 0 && (
         <div className="flex flex-col gap-2">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Modelos cadastrados</p>
-          {leds.map((led) => (
-            <div
-              key={led.id}
-              onClick={() => onSelect(led.id)}
-              className={`flex items-center gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
-                selectedId === led.id
-                  ? "border-yellow-500/60 bg-yellow-500/10"
-                  : "border-border bg-background hover:border-border/80"
-              }`}
-            >
-              {led.photoUrl ? (
-                <img src={led.photoUrl} alt={led.name} className="h-10 w-10 rounded object-cover flex-shrink-0" />
-              ) : (
-                <div className="h-10 w-10 rounded bg-muted flex items-center justify-center flex-shrink-0">
-                  <Zap className="h-4 w-4 text-muted-foreground" />
-                </div>
-              )}
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium truncate">{led.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {led.width} × {led.height} mm · {led.power} W/un
-                </p>
-              </div>
-              {selectedId === led.id && (
-                <span className="text-[10px] font-bold text-yellow-400 bg-yellow-500/20 px-1.5 py-0.5 rounded">ATIVO</span>
-              )}
-              <button
-                onClick={(e) => { e.stopPropagation(); onRemove(led.id); }}
-                className="text-muted-foreground hover:text-destructive transition-colors ml-1"
+          {leds.map((led) => {
+            const { calcW, calcH } = ledCalcDims(led, 0);
+            return (
+              <div
+                key={led.id}
+                onClick={() => onSelect(led.id)}
+                className={`flex items-center gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
+                  selectedId === led.id
+                    ? "border-yellow-500/60 bg-yellow-500/10"
+                    : "border-border bg-background hover:border-border/80"
+                }`}
               >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          ))}
+                {led.photoUrl ? (
+                  <img src={led.photoUrl} alt={led.name} className="h-10 w-10 rounded object-cover flex-shrink-0" />
+                ) : (
+                  <div className="h-10 w-10 rounded bg-muted flex items-center justify-center flex-shrink-0">
+                    <Zap className="h-4 w-4 text-muted-foreground" />
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate">{led.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Visual: {led.widthMm}×{led.heightMm} mm · Cálculo: {calcW.toFixed(1)}×{calcH.toFixed(1)} mm · {led.power} W/un
+                  </p>
+                </div>
+                {selectedId === led.id && (
+                  <span className="text-[10px] font-bold text-yellow-400 bg-yellow-500/20 px-1.5 py-0.5 rounded">ATIVO</span>
+                )}
+                <button
+                  onClick={(e) => { e.stopPropagation(); onRemove(led.id); }}
+                  className="text-muted-foreground hover:text-destructive transition-colors ml-1"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -627,25 +649,35 @@ function LedRegistrationPanel({
           />
         </div>
 
-        <div className="grid grid-cols-3 gap-2">
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs text-muted-foreground">Largura (mm)</Label>
-            <Input type="number" min={0.1} step={0.1} value={form.width}
-              onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setForm((f) => ({ ...f, width: v })); }}
-              className="h-8 text-sm" />
+        <div className="rounded-md border border-blue-500/20 bg-blue-500/5 p-2">
+          <p className="text-[9px] text-blue-300/80 mb-1">
+            Dimensões visuais do módulo. Para cálculo: largura −2 mm, altura −1 mm (margem de respiro).
+          </p>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="flex flex-col gap-1">
+              <Label className="text-xs text-muted-foreground">Larg. X (mm)</Label>
+              <Input type="number" min={0.1} step={0.1} value={form.widthMm}
+                onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setForm((f) => ({ ...f, widthMm: v })); }}
+                className="h-8 text-sm" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label className="text-xs text-muted-foreground">Alt. Y (mm)</Label>
+              <Input type="number" min={0.1} step={0.1} value={form.heightMm}
+                onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setForm((f) => ({ ...f, heightMm: v })); }}
+                className="h-8 text-sm" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label className="text-xs text-muted-foreground">Potência (W)</Label>
+              <Input type="number" min={0} step={0.01} value={form.power}
+                onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= 0) setForm((f) => ({ ...f, power: v })); }}
+                className="h-8 text-sm" />
+            </div>
           </div>
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs text-muted-foreground">Altura (mm)</Label>
-            <Input type="number" min={0.1} step={0.1} value={form.height}
-              onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v > 0) setForm((f) => ({ ...f, height: v })); }}
-              className="h-8 text-sm" />
-          </div>
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs text-muted-foreground">Potência (W)</Label>
-            <Input type="number" min={0} step={0.01} value={form.power}
-              onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= 0) setForm((f) => ({ ...f, power: v })); }}
-              className="h-8 text-sm" />
-          </div>
+          {form.widthMm > 0 && form.heightMm > 0 && (
+            <p className="text-[9px] text-muted-foreground/70 mt-1">
+              Cálculo: {Math.max(1, form.widthMm - 2).toFixed(1)} × {Math.max(1, form.heightMm - 1).toFixed(1)} mm
+            </p>
+          )}
         </div>
 
         <Button onClick={handleAdd} disabled={!form.name.trim()} variant="secondary" className="w-full h-8 text-sm">
@@ -656,29 +688,21 @@ function LedRegistrationPanel({
   );
 }
 
-// ─── LED Visualization Canvas (shape-aware, multi-LED, rotatable) ─────────
+// ─── LED Visualization Canvas (shape-aware, multi-LED) ───────────────────────
 function LedDrawingCanvas({
-  groups,
-  ledModels,
-  selectedLedId,
-  ledAssignments,
-  borderMargin = 4,
-  letterHeight = null,
-  ledRotation = 0,
-  engine = "centerline",
+  groups, ledModels, selectedLedId, ledAssignments,
+  letterThicknessMm = null, engine = "centerline", numCenterlines = 1,
 }: {
   groups: ReturnType<typeof groupParts>;
   ledModels: LedModel[];
   selectedLedId: string | null;
   ledAssignments: LedAssignment;
-  borderMargin?: number;
-  letterHeight?: number | null;
-  ledRotation?: 0 | 90;
+  letterThicknessMm?: number | null;
   engine?: LedEngine;
+  numCenterlines?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Resolve which LED model to use for a given group key
   const resolveLed = useCallback((groupKey: string): LedModel | null => {
     const assignedId = ledAssignments[groupKey] ?? selectedLedId;
     return ledModels.find((l) => l.id === assignedId) ?? null;
@@ -693,11 +717,13 @@ function LedDrawingCanvas({
     const ROWS = Math.ceil(groups.length / COLS);
     const CELL_PAD = 24;
     const LABEL_TOP = 16;
-    const LABEL_BOTTOM = 48;
+    const LABEL_BOTTOM = 56; // aumentado para caber dimensões reais
     const MAX_PART = 150;
 
-    const maxW = Math.max(...groups.map((g) => g.width));
-    const maxH = Math.max(...groups.map((g) => g.height));
+    let maxW = 0, maxH = 0;
+    for (const g of groups) { if (g.width > maxW) maxW = g.width; if (g.height > maxH) maxH = g.height; }
+    if (maxW === 0) maxW = 100; if (maxH === 0) maxH = 100;
+
     const cellW = Math.min(MAX_PART, maxW) + 2 * CELL_PAD;
     const cellH = Math.min(MAX_PART, maxH) + 2 * CELL_PAD + LABEL_TOP + LABEL_BOTTOM;
 
@@ -717,7 +743,6 @@ function LedDrawingCanvas({
     groups.forEach((g, gi) => {
       const col = gi % COLS;
       const row = Math.floor(gi / COLS);
-
       const ledModel = resolveLed(g.key);
 
       const scaleX = Math.min(1, (cellW - 2 * CELL_PAD) / g.width);
@@ -753,7 +778,6 @@ function LedDrawingCanvas({
           ctx.lineTo(sp.x, sp.y);
         }
         ctx.closePath();
-        // White/light fill for centerline look (like Figura 2)
         ctx.fillStyle = engine === "centerline" ? "#f0f9ff" : "#1e3a5f";
         ctx.fill();
         ctx.strokeStyle = engine === "centerline" ? "#2563eb" : "#3b82f6";
@@ -770,7 +794,7 @@ function LedDrawingCanvas({
             ctx.lineTo(sh.x, sh.y);
           }
           ctx.closePath();
-          ctx.fillStyle = engine === "centerline" ? "#0f172a" : "#0f172a";
+          ctx.fillStyle = engine === "centerline" ? "#f8fafc" : "#0f172a";
           ctx.fill();
           ctx.strokeStyle = "#60a5fa88";
           ctx.lineWidth = 1;
@@ -778,21 +802,21 @@ function LedDrawingCanvas({
         }
 
         if (ledModel) {
-          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, engine);
+          const { positions, totalLeds, pitchX, pitchY, bestRotation: partRot, numLines } = calcLedsForPart(poly, holes, ledModel, letterThicknessMm, engine, numCenterlines);
 
-          // LED dims with auto-selected rotation
-          const rawW = partRot === 90 ? ledModel.height : ledModel.width;
-          const rawH = partRot === 90 ? ledModel.width : ledModel.height;
-          const ledW = Math.max(2, rawW * s);
-          const ledH = Math.max(2, rawH * s);
-          const ledR = Math.max(2, Math.min(ledW, ledH) / 2);
+          // Tamanho visual real do LED na tela
+          const rawW = partRot === 90 ? ledModel.heightMm : ledModel.widthMm;
+          const rawH = partRot === 90 ? ledModel.widthMm : ledModel.heightMm;
+          const ledDispW = Math.max(2, rawW * s);
+          const ledDispH = Math.max(2, rawH * s);
+          const ledR = Math.max(2, Math.min(ledDispW, ledDispH) / 2);
 
           for (const pos of positions) {
             const lx = ox + (pos.x - pminX) * s;
             const ly = oy + (pos.y - pminY) * s;
 
             if (engine === "centerline") {
-              // Glow halo
+              // Glow + dot circular
               const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, ledR * 2.2);
               grd.addColorStop(0, "#fde68a99");
               grd.addColorStop(1, "#f59e0b00");
@@ -800,7 +824,6 @@ function LedDrawingCanvas({
               ctx.arc(lx, ly, ledR * 2.2, 0, Math.PI * 2);
               ctx.fillStyle = grd;
               ctx.fill();
-              // LED dot (round)
               ctx.beginPath();
               ctx.arc(lx, ly, ledR, 0, Math.PI * 2);
               ctx.fillStyle = "#fde68a";
@@ -809,54 +832,63 @@ function LedDrawingCanvas({
               ctx.lineWidth = 0.7;
               ctx.stroke();
             } else {
-              // Grid: rectangle with glow
-              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(ledW, ledH));
+              // Grid: retângulo com glow
+              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(ledDispW, ledDispH));
               grd.addColorStop(0, "#fde68aaa");
               grd.addColorStop(1, "#f59e0b00");
               ctx.beginPath();
-              ctx.arc(lx, ly, Math.max(ledW, ledH), 0, Math.PI * 2);
+              ctx.arc(lx, ly, Math.max(ledDispW, ledDispH), 0, Math.PI * 2);
               ctx.fillStyle = grd;
               ctx.fill();
               ctx.fillStyle = "#fde68a";
               ctx.strokeStyle = "#f59e0b";
               ctx.lineWidth = 0.5;
-              ctx.fillRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
-              ctx.strokeRect(lx - ledW / 2, ly - ledH / 2, ledW, ledH);
+              ctx.fillRect(lx - ledDispW / 2, ly - ledDispH / 2, ledDispW, ledDispH);
+              ctx.strokeRect(lx - ledDispW / 2, ly - ledDispH / 2, ledDispW, ledDispH);
             }
           }
 
+          // Label topo: dimensão real da peça (largura X × altura Y)
           ctx.fillStyle = engine === "centerline" ? "#475569" : "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
-          ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
+          ctx.fillText(`${g.width.toFixed(0)}(X) × ${g.height.toFixed(0)}(Y) mm`, ox + pw / 2, oy - 2);
 
+          // Label inferior: LEDs, pitch, dimensão real LED
+          const ledSzLabel = `LED: ${ledModel.widthMm}×${ledModel.heightMm}mm`;
           ctx.fillStyle = engine === "centerline" ? "#1e40af" : "#fde68a";
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs  ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
 
-          // LED name badge
           ctx.fillStyle = engine === "centerline" ? "#7c3aed" : "#a855f7";
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(ledModel.name + (engine === "centerline" ? " (linha central)" : partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
+          const lineInfo = engine === "centerline" ? ` · ${numLines} linha${numLines > 1 ? "s" : ""}` : (partRot === 90 ? " ↺90°" : "");
+          ctx.fillText(`${ledModel.name}${lineInfo}`, ox + pw / 2, oy + ph + 20);
 
-          const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+          ctx.fillStyle = "#64748b";
+          ctx.font = "8px monospace";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "top";
+          ctx.fillText(ledSzLabel, ox + pw / 2, oy + ph + 30);
+
+          const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, letterThicknessMm);
           const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
           ctx.fillStyle = "#10b981";
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 32);
+          ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 42);
         } else {
           ctx.fillStyle = engine === "centerline" ? "#94a3b8" : "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
-          ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
+          ctx.fillText(`${g.width.toFixed(0)}(X) × ${g.height.toFixed(0)}(Y) mm`, ox + pw / 2, oy - 2);
           ctx.fillStyle = "#ef4444";
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
@@ -864,7 +896,7 @@ function LedDrawingCanvas({
           ctx.fillText("Sem LED atribuído", ox + pw / 2, oy + ph + 8);
         }
 
-        // Qty badge
+        // Badge quantidade
         const badgeW = 24, badgeH = 14;
         ctx.fillStyle = "#1e40af";
         ctx.beginPath();
@@ -877,6 +909,7 @@ function LedDrawingCanvas({
         ctx.fillText(`×${g.quantity}`, ox + pw - badgeW / 2 - 2, oy + 2 + badgeH / 2);
 
       } else {
+        // Fallback bbox
         ctx.fillStyle = engine === "centerline" ? "#e0f2fe" : "#1e3a5f";
         ctx.strokeStyle = "#3b82f6";
         ctx.lineWidth = 1.5;
@@ -884,12 +917,12 @@ function LedDrawingCanvas({
         ctx.strokeRect(ox, oy, pw, ph);
 
         if (ledModel) {
-          const { totalLeds, pitchX, pitchY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+          const { totalLeds, pitchX, pitchY } = calcLedsForBbox(g.width, g.height, ledModel, letterThicknessMm);
           ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
-          ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
+          ctx.fillText(`${g.width.toFixed(0)}(X) × ${g.height.toFixed(0)}(Y) mm`, ox + pw / 2, oy - 2);
           ctx.fillStyle = "#fde68a";
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
@@ -898,7 +931,7 @@ function LedDrawingCanvas({
         }
       }
     });
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, engine, resolveLed]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterThicknessMm, engine, numCenterlines, resolveLed]);
 
   const bgColor = engine === "centerline" ? "#f8fafc" : "#0f172a";
 
@@ -909,20 +942,97 @@ function LedDrawingCanvas({
   );
 }
 
-
-// ─── Print Plan ───────────────────────────────────────────────────────────────
-function printPlan(
+// ─── Impressão separada: Plano de Corte ──────────────────────────────────────
+function printCutPlan(
   result: NestResult,
   opts: NestingOptions,
+  fileName: string,
+  stats: { placed: number; unplaced: number; utilization: number; sheets: number } | null,
+) {
+  const win = window.open("", "_blank", "width=1200,height=900");
+  if (!win) { alert("Permita popups para imprimir."); return; }
+
+  // Renderiza cada chapa em canvas
+  const sheetDataUrls: string[] = [];
+  for (let si = 0; si < result.sheets.length; si++) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1100; canvas.height = 750;
+    const wrapper = document.createElement("div");
+    wrapper.style.width = "1100px"; wrapper.style.height = "750px";
+    wrapper.appendChild(canvas);
+    document.body.appendChild(wrapper);
+    renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, null, false, null);
+    sheetDataUrls.push(canvas.toDataURL("image/png", 1.0));
+    document.body.removeChild(wrapper);
+  }
+
+  const now = new Date().toLocaleString("pt-BR");
+  const totalParts = result.sheets.reduce((s, sh) => s + sh.length, 0);
+
+  let html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Plano de Corte – ${fileName}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #fff; color: #111; padding: 20px; }
+  h1 { font-size: 17px; font-weight: 700; border-bottom: 2px solid #111; padding-bottom: 6px; margin-bottom: 4px; }
+  .meta { font-size: 10px; color: #555; margin-bottom: 16px; }
+  .section { margin-bottom: 24px; }
+  .section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 3px; margin-bottom: 10px; color: #333; }
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px; }
+  .stat-box { border: 1px solid #ddd; padding: 8px; }
+  .stat-label { font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
+  .stat-val { font-size: 18px; font-weight: 700; }
+  .sheet-block { page-break-inside: avoid; margin-bottom: 20px; }
+  .sheet-label { font-size: 10px; font-weight: 700; margin-bottom: 5px; }
+  .sheet-img { border: 1px solid #bbb; display: block; max-width: 100%; }
+  .no-print { position: fixed; top: 12px; right: 12px; }
+  @media print {
+    .no-print { display: none; }
+    @page { margin: 1cm; size: A4 landscape; }
+    .sheet-block { page-break-before: always; }
+    .sheet-block:first-of-type { page-break-before: auto; }
+  }
+</style></head><body>`;
+
+  html += `<h1>✂️ Plano de Corte – ${fileName}</h1>
+<div class="meta">Gerado: ${now} &nbsp;|&nbsp; Chapa: ${opts.sheetWidth}(X)×${opts.sheetHeight}(Y) mm &nbsp;|&nbsp; Folga: ${opts.gap} mm &nbsp;|&nbsp; Margem: ${opts.margin} mm</div>`;
+
+  html += `<div class="section"><div class="section-title">Resumo</div>
+<div class="stats-grid">
+  <div class="stat-box"><div class="stat-label">Chapas usadas</div><div class="stat-val">${result.sheets.length}</div></div>
+  <div class="stat-box"><div class="stat-label">Peças posicionadas</div><div class="stat-val">${totalParts}</div></div>
+  ${stats?.unplaced ? `<div class="stat-box"><div class="stat-label" style="color:#c00">Não posicionadas</div><div class="stat-val" style="color:#c00">${stats.unplaced}</div></div>` : ""}
+  <div class="stat-box"><div class="stat-label">Aproveitamento</div><div class="stat-val">${stats ? (stats.utilization * 100).toFixed(1) : "–"}%</div></div>
+</div></div>`;
+
+  html += `<div class="section"><div class="section-title">Chapas de Corte</div>`;
+  for (let si = 0; si < result.sheets.length; si++) {
+    const sh = result.sheets[si];
+    html += `<div class="sheet-block">
+<div class="sheet-label">Chapa ${si + 1} — ${sh.length} peça(s) — ${opts.sheetWidth}×${opts.sheetHeight} mm</div>
+<img class="sheet-img" src="${sheetDataUrls[si]}" />
+</div>`;
+  }
+  html += `</div>`;
+
+  html += `<div class="no-print"><button onclick="window.print()" style="background:#111;color:#fff;border:none;padding:10px 20px;font-size:14px;cursor:pointer;font-family:monospace;">🖨️ Imprimir Corte</button></div>`;
+  html += `</body></html>`;
+
+  win.document.write(html);
+  win.document.close();
+  setTimeout(() => win.focus(), 300);
+}
+
+// ─── Impressão separada: Plano de LED ────────────────────────────────────────
+function printLedPlan(
+  groups: ReturnType<typeof groupParts>,
   ledModels: LedModel[],
   selectedLedId: string | null,
   ledAssignments: LedAssignment,
-  showLeds: boolean,
-  borderMargin: number,
-  letterHeight: number | null,
-  ledRotation: 0 | 90,
-  groups: ReturnType<typeof groupParts>,
   ledSummary: { rows: any[]; totalLeds: number; totalPower: number } | null,
+  letterThicknessMm: number | null,
+  engine: LedEngine,
+  numCenterlines: number,
   fileName: string,
 ) {
   const win = window.open("", "_blank", "width=1200,height=900");
@@ -933,170 +1043,165 @@ function printPlan(
     return ledModels.find((l) => l.id === assignedId) ?? null;
   };
 
-  const globalLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
-
-  // Build all sheet canvases as data-URLs
-  const sheetDataUrls: string[] = [];
-  for (let si = 0; si < result.sheets.length; si++) {
-    const canvas = document.createElement("canvas");
-    canvas.width = 900; canvas.height = 600;
-    // Hack: give it a fake parentElement
-    const wrapper = document.createElement("div");
-    wrapper.style.width = "900px"; wrapper.style.height = "600px";
-    wrapper.appendChild(canvas);
-    document.body.appendChild(wrapper);
-    renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, globalLed, showLeds, 0, letterHeight, ledRotation);
-    sheetDataUrls.push(canvas.toDataURL("image/png"));
-    document.body.removeChild(wrapper);
-  }
-
-  // Build LED drawing canvases per group
+  // Renderiza cada grupo em canvas individual (alta resolução para impressão)
   const ledUrls: string[] = [];
-  if (groups.length) {
-    for (const g of groups) {
-      const ledModel = resolveLed(g.key);
-      const poly = g.parts[0]?.outer ?? [];
-      const holes = g.parts[0]?.holes ?? [];
+  for (const g of groups) {
+    const ledModel = resolveLed(g.key);
+    const poly = g.parts[0]?.outer ?? [];
+    const holes = g.parts[0]?.holes ?? [];
 
-      let totalLeds = 0, pitch = 0;
-      if (ledModel) {
-        if (poly.length) {
-          const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
-          totalLeds = r.totalLeds; pitch = r.pitch;
-        } else {
-          const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
-          totalLeds = r.totalLeds; pitch = r.pitch;
-        }
+    // Escala para impressão: ao menos 200px de largura, máx 350px
+    const S = Math.min(5, Math.max(1, 280 / Math.max(g.width, g.height)));
+    const pw = Math.round(g.width * S);
+    const ph = Math.round(g.height * S);
+    const PAD = 28;
+    const FOOTER = 60;
+    const cw = pw + 2 * PAD;
+    const ch = ph + 2 * PAD + FOOTER;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = cw * 2; canvas.height = ch * 2; // 2x para HiDPI
+    const ctx = canvas.getContext("2d")!;
+    ctx.scale(2, 2);
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cw, ch);
+
+    const ox = PAD, oy = PAD;
+
+    if (poly.length > 0) {
+      let pminX = Infinity, pminY = Infinity;
+      for (const p of poly) { if (p.x < pminX) pminX = p.x; if (p.y < pminY) pminY = p.y; }
+      const toS = (p: { x: number; y: number }) => ({ x: ox + (p.x - pminX) * S, y: oy + (p.y - pminY) * S });
+
+      // Forma da peça
+      ctx.beginPath();
+      const sp0 = toS(poly[0]); ctx.moveTo(sp0.x, sp0.y);
+      for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
+      ctx.closePath();
+      ctx.fillStyle = "#e8f4fd"; ctx.fill();
+      ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5; ctx.stroke();
+
+      // Furos
+      for (const hole of holes) {
+        if (!hole.length) continue;
+        ctx.beginPath();
+        const sh0 = toS(hole[0]); ctx.moveTo(sh0.x, sh0.y);
+        for (let i = 1; i < hole.length; i++) { const sh = toS(hole[i]); ctx.lineTo(sh.x, sh.y); }
+        ctx.closePath();
+        ctx.fillStyle = "#fff"; ctx.fill();
+        ctx.strokeStyle = "#93c5fd"; ctx.lineWidth = 1; ctx.stroke();
       }
 
-      const S = Math.min(3, 300 / Math.max(g.width, g.height));
-      const cw = Math.round(g.width * S + 48);
-      const ch = Math.round(g.height * S + 80);
-      const canvas = document.createElement("canvas");
-      canvas.width = cw; canvas.height = ch;
-      const ctx = canvas.getContext("2d")!;
-      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cw, ch);
+      // LEDs
+      if (ledModel) {
+        const { positions, bestRotation: partRot, numLines } = calcLedsForPart(poly, holes, ledModel, letterThicknessMm, engine, numCenterlines);
+        // Tamanho visual real do LED
+        const rawW = partRot === 90 ? ledModel.heightMm : ledModel.widthMm;
+        const rawH = partRot === 90 ? ledModel.widthMm : ledModel.heightMm;
+        const ledDispW = Math.max(2, rawW * S);
+        const ledDispH = Math.max(2, rawH * S);
 
-      const ox = 24, oy = 24;
-      const pw = g.width * S, ph = g.height * S;
+        for (const pos of positions) {
+          const lx = ox + (pos.x - pminX) * S;
+          const ly = oy + (pos.y - pminY) * S;
 
-      if (poly.length > 0) {
-        let pminX = Infinity, pminY = Infinity;
-        for (const p of poly) { if (p.x < pminX) pminX = p.x; if (p.y < pminY) pminY = p.y; }
-        const toS = (p: {x:number;y:number}) => ({ x: ox + (p.x - pminX) * S, y: oy + (p.y - pminY) * S });
-
-        ctx.beginPath();
-        const sp0 = toS(poly[0]); ctx.moveTo(sp0.x, sp0.y);
-        for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
-        ctx.closePath();
-        ctx.fillStyle = "#e8f4fd"; ctx.fill();
-        ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5; ctx.stroke();
-
-        for (const hole of holes) {
-          if (!hole.length) continue;
-          ctx.beginPath();
-          const sh0 = toS(hole[0]); ctx.moveTo(sh0.x, sh0.y);
-          for (let i = 1; i < hole.length; i++) { const sh = toS(hole[i]); ctx.lineTo(sh.x, sh.y); }
-          ctx.closePath();
-          ctx.fillStyle = "#fff"; ctx.fill();
-          ctx.strokeStyle = "#93c5fd"; ctx.lineWidth = 1; ctx.stroke();
-        }
-
-        if (ledModel) {
-          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation);
-          const rawW = partRot === 90 ? ledModel.height : ledModel.width;
-          const rawH = partRot === 90 ? ledModel.width : ledModel.height;
-          const ledW = Math.max(1.5, rawW * S);
-          const ledH = Math.max(1.5, rawH * S);
-          for (const pos of positions) {
-            const lx = ox + (pos.x - pminX) * S;
-            const ly = oy + (pos.y - pminY) * S;
+          if (engine === "centerline") {
+            ctx.beginPath();
+            ctx.arc(lx, ly, Math.min(ledDispW, ledDispH) / 2, 0, Math.PI * 2);
+            ctx.fillStyle = "#facc15"; ctx.fill();
+            ctx.strokeStyle = "#92400e"; ctx.lineWidth = 0.5; ctx.stroke();
+          } else {
             ctx.fillStyle = "#facc15"; ctx.strokeStyle = "#d97706"; ctx.lineWidth = 0.5;
-            ctx.fillRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
-            ctx.strokeRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
+            ctx.fillRect(lx - ledDispW / 2, ly - ledDispH / 2, ledDispW, ledDispH);
+            ctx.strokeRect(lx - ledDispW / 2, ly - ledDispH / 2, ledDispW, ledDispH);
           }
         }
-      } else {
-        ctx.fillStyle = "#e8f4fd"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5;
-        ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
-      }
 
-      const ledLabel = ledModel ? `${ledModel.name}  |  ${totalLeds} LEDs  |  pitch ${pitch.toFixed(1)}mm` : "Sem LED";
-      ctx.fillStyle = "#111"; ctx.font = "bold 10px monospace";
-      ctx.textAlign = "center"; ctx.textBaseline = "top";
-      ctx.fillText(`${g.width.toFixed(0)}×${g.height.toFixed(0)}mm  |  ${ledLabel}  |  ×${g.quantity}pç`, cw/2, oy + ph + 6);
-      ledUrls.push(canvas.toDataURL("image/png"));
+        // Dimensões reais indicadas na figura
+        const { totalLeds, pitchX, pitchY } = calcLedsForPart(poly, holes, ledModel, letterThicknessMm, engine, numCenterlines);
+        // Setas de cota: largura X
+        ctx.strokeStyle = "#374151"; ctx.lineWidth = 0.7; ctx.setLineDash([3, 2]);
+        ctx.beginPath(); ctx.moveTo(ox, oy + ph + 8); ctx.lineTo(ox + pw, oy + ph + 8); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#111"; ctx.font = "bold 8px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(`${g.width.toFixed(0)} mm`, ox + pw / 2, oy + ph + 7);
+
+        // Footer
+        const ledInfo = ledModel ? `LED: ${ledModel.widthMm}×${ledModel.heightMm}mm (calc: ${(ledModel.widthMm - 2).toFixed(1)}×${(ledModel.heightMm - 1).toFixed(1)}mm)` : "Sem LED";
+        const lineInfo = engine === "centerline" ? ` · ${numLines} linha${numLines > 1 ? "s" : ""}` : "";
+        ctx.fillStyle = "#111"; ctx.font = "bold 9px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(`${g.width.toFixed(0)}(X) × ${g.height.toFixed(0)}(Y) mm  |  ×${g.quantity} pç`, cw / 2, oy + ph + 16);
+        ctx.font = "8px monospace";
+        ctx.fillText(`${totalLeds} LEDs  |  Pitch: ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm${lineInfo}`, cw / 2, oy + ph + 28);
+        ctx.fillText(ledInfo, cw / 2, oy + ph + 40);
+      }
+    } else {
+      // Bbox fallback
+      ctx.fillStyle = "#e8f4fd"; ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5;
+      ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
+      if (ledModel) {
+        const { totalLeds, pitchX, pitchY } = calcLedsForBbox(g.width, g.height, ledModel, letterThicknessMm);
+        ctx.fillStyle = "#111"; ctx.font = "bold 9px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(`${g.width.toFixed(0)}(X) × ${g.height.toFixed(0)}(Y) mm | ${totalLeds} LEDs | ×${g.quantity}`, cw / 2, oy + ph + 8);
+        ctx.font = "8px monospace";
+        ctx.fillText(`Pitch: ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm | LED: ${ledModel.widthMm}×${ledModel.heightMm}mm`, cw / 2, oy + ph + 20);
+      }
     }
+
+    ledUrls.push(canvas.toDataURL("image/png", 1.0));
   }
 
   const now = new Date().toLocaleString("pt-BR");
-  const totalParts = result.sheets.reduce((s, sh) => s + sh.length, 0);
-  const letterInfo = letterHeight ? `Altura da letra: ${letterHeight}mm · Pitch: ${calcPitchFromLetterHeight(letterHeight).toFixed(1)}mm` : "";
+  const thicknessInfo = letterThicknessMm ? `Espessura Z: ${letterThicknessMm}mm · Pitch: ${calcPitchFromLetterThickness(letterThicknessMm).toFixed(1)}mm` : `Espessura Z: ${DEFAULT_LETTER_THICKNESS_MM}mm (padrão) · Pitch: ${calcPitchFromLetterThickness(DEFAULT_LETTER_THICKNESS_MM).toFixed(1)}mm`;
 
   let html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Plano de Corte – ${fileName}</title>
+<title>Plano de LED – ${fileName}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Courier New', monospace; background: #fff; color: #111; padding: 24px; }
-  h1 { font-size: 18px; font-weight: 700; border-bottom: 2px solid #111; padding-bottom: 8px; margin-bottom: 4px; }
-  .meta { font-size: 11px; color: #555; margin-bottom: 20px; }
-  .section { margin-bottom: 28px; }
-  .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-bottom: 12px; color: #333; }
-  .sheet-block { page-break-inside: avoid; margin-bottom: 24px; }
-  .sheet-label { font-size: 11px; font-weight: 700; margin-bottom: 6px; }
-  .sheet-img { border: 1px solid #bbb; display: block; max-width: 100%; }
-  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  body { font-family: 'Courier New', monospace; background: #fff; color: #111; padding: 20px; }
+  h1 { font-size: 17px; font-weight: 700; border-bottom: 2px solid #111; padding-bottom: 6px; margin-bottom: 4px; }
+  .meta { font-size: 10px; color: #555; margin-bottom: 16px; }
+  .section { margin-bottom: 24px; }
+  .section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 3px; margin-bottom: 10px; color: #333; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+  .stat-box { border: 1px solid #ddd; padding: 8px; }
+  .stat-label { font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
+  .stat-val { font-size: 18px; font-weight: 700; }
+  .led-grid { display: flex; flex-wrap: wrap; gap: 16px; }
+  .led-card { border: 1px solid #ddd; padding: 8px; page-break-inside: avoid; background: #fafafa; }
+  .led-img { display: block; border: 1px solid #eee; max-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 10px; }
   th { background: #f3f4f6; text-align: right; padding: 5px 8px; border: 1px solid #ddd; font-weight: 700; }
   th:first-child { text-align: left; }
   td { padding: 4px 8px; border: 1px solid #eee; text-align: right; }
   td:first-child { text-align: left; }
   tr:nth-child(even) td { background: #f9fafb; }
   .total-row td { font-weight: 700; background: #f3f4f6 !important; border-top: 2px solid #bbb; }
-  .led-grid { display: flex; flex-wrap: wrap; gap: 16px; }
-  .led-card { border: 1px solid #ddd; padding: 8px; page-break-inside: avoid; }
-  .led-img { display: block; border: 1px solid #eee; }
-  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-  .stat-box { border: 1px solid #ddd; padding: 10px; }
-  .stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
-  .stat-val { font-size: 20px; font-weight: 700; }
+  .legend { font-size: 9px; color: #555; margin-top: 6px; font-style: italic; }
+  .no-print { position: fixed; top: 12px; right: 12px; }
   @media print {
-    body { padding: 12px; }
     .no-print { display: none; }
-    @page { margin: 1cm; size: A4 landscape; }
+    @page { margin: 1cm; size: A4 portrait; }
+    .led-card { page-break-inside: avoid; }
   }
 </style></head><body>`;
 
-  html += `<h1>📐 Plano de Corte e LED</h1>
-<div class="meta">Arquivo: <b>${fileName}</b> &nbsp;|&nbsp; Gerado: ${now} &nbsp;|&nbsp; Chapa: ${opts.sheetWidth}×${opts.sheetHeight}mm &nbsp;|&nbsp; Folga: ${opts.gap}mm &nbsp;|&nbsp; Margem: ${opts.margin}mm${letterInfo ? ` &nbsp;|&nbsp; ${letterInfo}` : ""}</div>`;
-
-  html += `<div class="section"><div class="section-title">Resumo</div>
-<div class="stats-grid">
-  <div class="stat-box"><div class="stat-label">Chapas usadas</div><div class="stat-val">${result.sheets.length}</div></div>
-  <div class="stat-box"><div class="stat-label">Peças posicionadas</div><div class="stat-val">${totalParts}</div></div>
-  <div class="stat-box"><div class="stat-label">Aproveitamento</div><div class="stat-val">${(result.utilization * 100).toFixed(1)}%</div></div>
-</div>`;
+  html += `<h1>💡 Plano de Posicionamento LED – ${fileName}</h1>
+<div class="meta">Gerado: ${now} &nbsp;|&nbsp; ${thicknessInfo} &nbsp;|&nbsp; Motor: ${engine === "centerline" ? "Linha Central" : "Grid"}</div>`;
 
   if (ledSummary) {
-    html += `<div class="stats-grid">
+    html += `<div class="section"><div class="section-title">Resumo de LEDs</div>
+<div class="stats-grid">
   <div class="stat-box"><div class="stat-label">Total de LEDs</div><div class="stat-val">${ledSummary.totalLeds.toLocaleString("pt-BR")}</div></div>
   <div class="stat-box"><div class="stat-label">Potência total</div><div class="stat-val">${ledSummary.totalPower.toFixed(1)} W</div></div>
-  <div class="stat-box"><div class="stat-label">Rotação LED</div><div class="stat-val">Auto</div></div>
+  <div class="stat-box"><div class="stat-label">Motor</div><div class="stat-val" style="font-size:13px">${engine === "centerline" ? "Linha Central" : "Grid"}</div></div>
+</div>
+<p class="legend">Dimensões: Largura = eixo X (horizontal) · Altura = eixo Y (vertical) · Espessura = eixo Z (profundidade da letra)<br>
+Margem de respiro: −2mm na largura, −1mm na altura do módulo para cálculo</p>
 </div>`;
   }
-  html += `</div>`;
-
-  html += `<div class="section"><div class="section-title">Chapas de Corte</div>`;
-  for (let si = 0; si < result.sheets.length; si++) {
-    const sh = result.sheets[si];
-    html += `<div class="sheet-block">
-<div class="sheet-label">Chapa ${si + 1} — ${sh.length} peça(s)</div>
-<img class="sheet-img" src="${sheetDataUrls[si]}" />
-</div>`;
-  }
-  html += `</div>`;
 
   if (ledUrls.length) {
-    html += `<div class="section"><div class="section-title">Plano de Posicionamento LED${letterHeight ? ` (altura letra ${letterHeight}mm)` : ""}</div>
+    html += `<div class="section"><div class="section-title">Posicionamento por Peça</div>
 <div class="led-grid">`;
     groups.forEach((g, gi) => {
       html += `<div class="led-card"><img class="led-img" src="${ledUrls[gi]}" /></div>`;
@@ -1105,19 +1210,17 @@ function printPlan(
   }
 
   if (ledSummary) {
-    html += `<div class="section"><div class="section-title">Detalhamento de LEDs por Modelo</div>
+    html += `<div class="section"><div class="section-title">Detalhamento por Modelo</div>
 <table><thead><tr>
-<th>Dimensões (mm)</th><th>LED usado</th><th>Qtd</th><th>Pitch (mm)</th><th>LEDs/peça</th><th>Total LEDs</th><th>Potência (W)</th>
+<th>Dimensões (X×Y mm)</th><th>LED</th><th>Qtd peças</th><th>Pitch X (mm)</th><th>Pitch Y (mm)</th><th>LEDs/peça</th><th>Total LEDs</th><th>Potência (W)</th>
 </tr></thead><tbody>`;
     for (const row of ledSummary.rows) {
-      html += `<tr><td>${row.width.toFixed(0)} × ${row.height.toFixed(0)}</td><td>${row.ledName}</td><td>${row.qty}</td><td>${row.pitch.toFixed(1)}</td><td>${row.ledsPerPiece}</td><td>${row.totalLeds}</td><td>${row.totalPower.toFixed(1)}</td></tr>`;
+      html += `<tr><td>${row.width.toFixed(0)} × ${row.height.toFixed(0)}</td><td>${row.ledName}</td><td>${row.qty}</td><td>${row.pitchX.toFixed(1)}</td><td>${row.pitchY.toFixed(1)}</td><td>${row.ledsPerPiece}</td><td>${row.totalLeds}</td><td>${row.totalPower.toFixed(1)}</td></tr>`;
     }
-    html += `</tbody><tfoot><tr class="total-row"><td colspan="5">TOTAL</td><td>${ledSummary.totalLeds.toLocaleString("pt-BR")}</td><td>${ledSummary.totalPower.toFixed(1)}</td></tr></tfoot></table></div>`;
+    html += `</tbody><tfoot><tr class="total-row"><td colspan="6">TOTAL</td><td>${ledSummary.totalLeds.toLocaleString("pt-BR")}</td><td>${ledSummary.totalPower.toFixed(1)}</td></tr></tfoot></table></div>`;
   }
 
-  html += `<div class="no-print" style="position:fixed;top:16px;right:16px;">
-<button onclick="window.print()" style="background:#111;color:#fff;border:none;padding:10px 20px;font-size:14px;cursor:pointer;font-family:monospace;">🖨️ Imprimir</button>
-</div>`;
+  html += `<div class="no-print"><button onclick="window.print()" style="background:#f59e0b;color:#111;border:none;padding:10px 20px;font-size:14px;cursor:pointer;font-family:monospace;font-weight:700;">🖨️ Imprimir LED</button></div>`;
   html += `</body></html>`;
 
   win.document.write(html);
@@ -1142,25 +1245,32 @@ export default function NestingApp() {
   // LED state — persisted in localStorage
   const [ledModels, setLedModels] = useState<LedModel[]>(() => {
     try {
-      const saved = localStorage.getItem("nestcnc_led_models");
-      return saved ? JSON.parse(saved) : [];
+      const saved = localStorage.getItem("nestcnc_led_models_v10");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // Migração: renomeia width→widthMm, height→heightMm se necessário
+        return parsed.map((l: any) => ({
+          ...l,
+          widthMm: l.widthMm ?? l.width ?? 5,
+          heightMm: l.heightMm ?? l.height ?? 5,
+        }));
+      }
+      return [];
     } catch { return []; }
   });
   const [selectedLedId, setSelectedLedId] = useState<string | null>(() => {
     try { return localStorage.getItem("nestcnc_led_selected"); } catch { return null; }
   });
-  // Per-group LED assignments (group key -> led id)
   const [ledAssignments, setLedAssignments] = useState<LedAssignment>({});
-  // LED rotation is always automatic (no manual control)
-  const ledRotation: 0 | 90 = 0; // kept for function signatures, auto-rotation happens inside calcLedsForPart
-  // Letter height for pitch calculation
-  const [letterHeight, setLetterHeight] = useState<number | null>(null);
-  const [letterHeightInput, setLetterHeightInput] = useState("");
-  // LED calculation engine
+  // Espessura da letra (eixo Z) para cálculo de pitch
+  const [letterThicknessMm, setLetterThicknessMm] = useState<number | null>(null);
+  const [letterThicknessInput, setLetterThicknessInput] = useState("");
+  // Motor de cálculo
   const [ledEngine, setLedEngine] = useState<LedEngine>("centerline");
+  // Número de linhas de LEDs no modo centerline
+  const [numCenterlines, setNumCenterlines] = useState(1);
 
   const [showLeds, setShowLeds] = useState(true);
-  const borderMargin = 0; // no border margin
   const [renderedLedId, setRenderedLedId] = useState<string | null>(null);
   const [ledKey, setLedKey] = useState(0);
 
@@ -1169,15 +1279,12 @@ export default function NestingApp() {
   const setOpt = <K extends keyof NestingOptions>(key: K, val: NestingOptions[K]) => setOpts((p) => ({ ...p, [key]: val }));
 
   const selectedLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
-  const ledNeedsUpdate = selectedLedId !== renderedLedId;
 
-  // Assign a specific LED to a group
   const assignLedToGroup = useCallback((groupKey: string, ledId: string) => {
     setLedAssignments((prev) => ({ ...prev, [groupKey]: ledId }));
     setLedKey((k) => k + 1);
   }, []);
 
-  // Clear assignment (revert to global)
   const clearGroupAssignment = useCallback((groupKey: string) => {
     setLedAssignments((prev) => {
       const next = { ...prev };
@@ -1225,10 +1332,10 @@ export default function NestingApp() {
     try { const r = runNesting(parts, opts); setResult(r); setActiveSheet(0); } finally { setNesting(false); }
   }, [parts, opts]);
 
+  // Persistência
   useEffect(() => {
-    try { localStorage.setItem("nestcnc_led_models", JSON.stringify(ledModels)); } catch {}
+    try { localStorage.setItem("nestcnc_led_models_v10", JSON.stringify(ledModels)); } catch {}
   }, [ledModels]);
-
   useEffect(() => {
     try {
       if (selectedLedId) localStorage.setItem("nestcnc_led_selected", selectedLedId);
@@ -1238,16 +1345,10 @@ export default function NestingApp() {
 
   const redraw = useCallback(() => {
     if (!result || !canvasRef.current || !containerRef.current) return;
-    renderSheet(
-      canvasRef.current,
-      result.sheets[activeSheet] ?? [],
-      opts.sheetWidth, opts.sheetHeight, opts.margin,
-      selectedLed, showLeds, 0, letterHeight, 0
-    );
-  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterHeight]);
+    renderSheet(canvasRef.current, result.sheets[activeSheet] ?? [], opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterThicknessMm);
+  }, [result, activeSheet, opts.sheetWidth, opts.sheetHeight, opts.margin, selectedLed, showLeds, letterThicknessMm]);
 
   useEffect(() => { redraw(); }, [redraw]);
-
   useEffect(() => {
     if (!result || !canvasRef.current || !containerRef.current) return;
     const obs = new ResizeObserver(redraw);
@@ -1271,7 +1372,7 @@ export default function NestingApp() {
     return { placed, unplaced: result.unplaced.length, models: groups.length, total: parts.length, utilization: result.utilization, sheets: result.sheets.length, totalBboxArea: result.totalBboxArea, totalPartArea: result.totalPartArea, totalSheetArea: result.totalSheetArea, sheetArea, perSheet };
   }, [result, parts, groups, opts.sheetWidth, opts.sheetHeight, opts.margin]);
 
-  // LED summary using shape-aware calc, respecting per-group assignments
+  // Resumo de LEDs
   const ledSummary = useMemo(() => {
     if (!groups.length || !ledModels.length) return null;
     const hasAnyLed = groups.some((g) => {
@@ -1289,20 +1390,20 @@ export default function NestingApp() {
       const holes = g.parts[0]?.holes ?? [];
       let totalLeds = 0, pitch = 0, pitchX = 0, pitchY = 0;
       if (poly.length) {
-        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
+        const r = calcLedsForPart(poly, holes, ledModel, letterThicknessMm, ledEngine, numCenterlines);
         totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       } else {
-        const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+        const r = calcLedsForBbox(g.width, g.height, ledModel, letterThicknessMm);
         totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       }
-      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, letterThicknessMm);
       const totalPower = totalLeds * ledModel.power * g.quantity;
       return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, pitchX, pitchY, totalPower, ledName: ledModel.name };
     });
     const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey, ledEngine]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterThicknessMm, ledKey, ledEngine, numCenterlines]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
@@ -1313,9 +1414,7 @@ export default function NestingApp() {
 
   const currentSheetParts = result?.sheets[activeSheet] ?? [];
   const activeLedForDisplay = ledModels.find((l) => l.id === renderedLedId) ?? null;
-
-  // Computed pitch display
-  const computedPitch = letterHeight && letterHeight > 0 ? calcPitchFromLetterHeight(letterHeight) : null;
+  const computedPitch = letterThicknessMm && letterThicknessMm > 0 ? calcPitchFromLetterThickness(letterThicknessMm) : calcPitchFromLetterThickness(DEFAULT_LETTER_THICKNESS_MM);
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -1330,7 +1429,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 9.1</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers {APP_VERSION}</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1374,8 +1473,8 @@ export default function NestingApp() {
           <section>
             <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Chapa</h2>
             <div className="grid grid-cols-2 gap-3">
-              <NumericField label="Largura" unit="mm" value={opts.sheetWidth} onChange={(v) => setOpt("sheetWidth", v)} min={1} />
-              <NumericField label="Altura" unit="mm" value={opts.sheetHeight} onChange={(v) => setOpt("sheetHeight", v)} min={1} />
+              <NumericField label="Largura (X)" unit="mm" value={opts.sheetWidth} onChange={(v) => setOpt("sheetWidth", v)} min={1} />
+              <NumericField label="Altura (Y)" unit="mm" value={opts.sheetHeight} onChange={(v) => setOpt("sheetHeight", v)} min={1} />
             </div>
           </section>
 
@@ -1406,22 +1505,34 @@ export default function NestingApp() {
             {nesting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />} Calcular Nesting
           </Button>
 
+          {/* Botões de impressão separados */}
           {result && (
-            <Button
-              variant="outline"
-              className="w-full border-slate-600 text-slate-300 hover:bg-slate-800 hover:text-white"
-              onClick={() => printPlan(result, opts, ledModels, selectedLedId, ledAssignments, showLeds, 0, letterHeight, 0, groups, ledSummary, fileName || "sem-nome.pdf")}
-            >
-              <Printer className="mr-2 h-4 w-4" /> Imprimir Plano de Corte
-            </Button>
+            <div className="flex flex-col gap-2">
+              <Button
+                variant="outline"
+                className="w-full border-slate-600 text-slate-300 hover:bg-slate-800 hover:text-white"
+                onClick={() => printCutPlan(result, opts, fileName || "sem-nome.pdf", stats)}
+              >
+                <Printer className="mr-2 h-4 w-4" /> Imprimir Plano de Corte
+              </Button>
+              {groups.length > 0 && ledModels.length > 0 && (
+                <Button
+                  variant="outline"
+                  className="w-full border-yellow-600/50 text-yellow-300 hover:bg-yellow-900/20"
+                  onClick={() => printLedPlan(groups, ledModels, selectedLedId, ledAssignments, ledSummary, letterThicknessMm, ledEngine, numCenterlines, fileName || "sem-nome.pdf")}
+                >
+                  <Zap className="mr-2 h-4 w-4" /> Imprimir Plano de LED
+                </Button>
+              )}
+            </div>
           )}
 
-          {/* LED overlay toggle */}
+          {/* LED overlay toggle (no nesting) */}
           {result && ledModels.length > 0 && (
             <section className="rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3">
-              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-yellow-400/80">Visualização LED</h2>
+              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-yellow-400/80">Visualização LED no Nesting</h2>
               <div className="flex items-center justify-between mb-2">
-                <Label className="text-xs">Mostrar LEDs no nesting</Label>
+                <Label className="text-xs">Mostrar LEDs</Label>
                 <Switch checked={showLeds} onCheckedChange={setShowLeds} />
               </div>
               {showLeds && (
@@ -1432,17 +1543,13 @@ export default function NestingApp() {
                       <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
                       <SelectContent>
                         {ledModels.map((l) => (
-                          <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
+                          <SelectItem key={l.id} value={l.id}>{l.name} ({l.widthMm}×{l.heightMm}mm)</SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
                   </div>
                   {selectedLedId && (
-                    <Button
-                      onClick={handleUpdateLed}
-                      variant="outline"
-                      className="w-full h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10"
-                    >
+                    <Button onClick={handleUpdateLed} variant="outline" className="w-full h-8 text-xs border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
                       <RefreshCw className="h-3.5 w-3.5 mr-1" /> Atualizar LED
                     </Button>
                   )}
@@ -1514,7 +1621,7 @@ export default function NestingApp() {
                     <div className="space-y-1 text-xs max-h-28 overflow-y-auto pr-1">
                       {groups.map((g, i) => (
                         <div key={i} className="flex justify-between gap-4">
-                          <span className="text-muted-foreground">{g.width.toFixed(0)} × {g.height.toFixed(0)} mm</span>
+                          <span className="text-muted-foreground">{g.width.toFixed(0)}(X) × {g.height.toFixed(0)}(Y) mm</span>
                           <span className="font-medium">× {g.quantity}</span>
                         </div>
                       ))}
@@ -1561,7 +1668,7 @@ export default function NestingApp() {
           {/* ── LEDs TAB ── */}
           {activeTab === "leds" && (
             <div className="flex flex-1 overflow-hidden">
-              {/* ── LEFT: Controls panel ── */}
+              {/* Painel de controles */}
               <div className="flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-4">
                 <div className="flex items-center gap-2">
                   <div className="flex h-7 w-7 items-center justify-center rounded-md bg-yellow-500/20">
@@ -1573,7 +1680,7 @@ export default function NestingApp() {
                   </div>
                 </div>
 
-                {/* ── Motor selector ── */}
+                {/* Motor de cálculo */}
                 <div className="rounded-lg border border-border bg-background p-3 flex flex-col gap-2">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Motor de Cálculo</p>
                   <div className="grid grid-cols-2 gap-1.5">
@@ -1596,37 +1703,57 @@ export default function NestingApp() {
                   </div>
                   <p className="text-[9px] text-muted-foreground/60 italic">
                     {ledEngine === "centerline"
-                      ? "LEDs no centro da espessura da peça, ao longo do comprimento"
+                      ? "LEDs no centro da espessura, ao longo do comprimento"
                       : "Grade uniforme com filtro pela forma real do polígono"}
                   </p>
                 </div>
 
-                {/* ── Letter height / espessura ── */}
+                {/* Linhas de LED (apenas centerline) */}
+                {ledEngine === "centerline" && (
+                  <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/5 p-3 flex flex-col gap-2">
+                    <Label className="text-[10px] font-semibold text-yellow-300 uppercase tracking-wider">Linhas de LED (Linha Central)</Label>
+                    <div className="flex gap-2 items-center">
+                      <Input
+                        type="number" min={1} max={10} step={1}
+                        value={numCenterlines}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value);
+                          if (!isNaN(v) && v >= 1) { setNumCenterlines(v); setLedKey((k) => k + 1); }
+                        }}
+                        className="h-7 text-xs w-20"
+                      />
+                      <span className="text-[10px] text-muted-foreground">linha{numCenterlines > 1 ? "s" : ""} paralela{numCenterlines > 1 ? "s" : ""}</span>
+                    </div>
+                    <p className="text-[9px] text-yellow-400/70">
+                      1 = linha central única · 2+ = múltiplas linhas paralelas ao centro
+                    </p>
+                  </div>
+                )}
+
+                {/* Espessura da letra (eixo Z) para pitch */}
                 <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 flex flex-col gap-2">
-                  <Label className="text-[10px] font-semibold text-yellow-300 uppercase tracking-wider">Altura da letra (mm)</Label>
+                  <Label className="text-[10px] font-semibold text-yellow-300 uppercase tracking-wider">Espessura da Letra · eixo Z (mm)</Label>
                   <div className="flex gap-2 items-center">
                     <Input
-                      type="number" min={1} step={1} placeholder={`Ex: 100`}
-                      value={letterHeightInput}
+                      type="number" min={1} step={1} placeholder={`Ex: ${DEFAULT_LETTER_THICKNESS_MM}`}
+                      value={letterThicknessInput}
                       onChange={(e) => {
-                        setLetterHeightInput(e.target.value);
+                        setLetterThicknessInput(e.target.value);
                         const v = parseFloat(e.target.value);
-                        setLetterHeight(!isNaN(v) && v > 0 ? v : null);
+                        setLetterThicknessMm(!isNaN(v) && v > 0 ? v : null);
                       }}
                       className="h-7 text-xs flex-1"
                     />
-                    {letterHeight && letterHeight > 0 && (
-                      <div className="text-[10px] text-yellow-300 font-mono whitespace-nowrap">
-                        → <strong>{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong>
-                      </div>
-                    )}
+                    <div className="text-[10px] text-yellow-300 font-mono whitespace-nowrap">
+                      → <strong>{computedPitch.toFixed(1)} mm</strong>
+                    </div>
                   </div>
                   <p className="text-[9px] text-yellow-400/70">
-                    Pitch = altura × 0,85 · Se vazio: usa espessura padrão {DEFAULT_THICKNESS_MM} mm
+                    Pitch = espessura Z × 0,85 (padrão: {DEFAULT_LETTER_THICKNESS_MM} mm → {calcPitchFromLetterThickness(DEFAULT_LETTER_THICKNESS_MM).toFixed(1)} mm)
                   </p>
                 </div>
 
-                {/* ── Global LED selector ── */}
+                {/* Seletor de LED global */}
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-[10px] text-muted-foreground uppercase tracking-wider">LED padrão</Label>
                   {ledModels.length === 0 ? (
@@ -1637,7 +1764,7 @@ export default function NestingApp() {
                         <SelectTrigger className="h-7 text-xs flex-1"><SelectValue placeholder="Selecionar LED" /></SelectTrigger>
                         <SelectContent>
                           {ledModels.map((l) => (
-                            <SelectItem key={l.id} value={l.id}>{l.name} ({l.width}×{l.height}mm)</SelectItem>
+                            <SelectItem key={l.id} value={l.id}>{l.name} ({l.widthMm}×{l.heightMm}mm)</SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
@@ -1650,7 +1777,7 @@ export default function NestingApp() {
                   )}
                 </div>
 
-                {/* ── Per-group assignments ── */}
+                {/* Atribuição por grupo */}
                 {ledModels.length > 1 && (
                   <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 flex flex-col gap-2">
                     <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-300 flex items-center gap-1">
@@ -1684,7 +1811,7 @@ export default function NestingApp() {
                   </div>
                 )}
 
-                {/* ── Summary cards ── */}
+                {/* Cards de resumo */}
                 {ledSummary && (
                   <div className="flex flex-col gap-2">
                     <div className="rounded-lg border border-border bg-background p-3">
@@ -1697,16 +1824,14 @@ export default function NestingApp() {
                         <p className="text-base font-bold text-orange-400">{ledSummary.totalPower.toFixed(1)} W</p>
                       </div>
                       <div className="rounded-lg border border-border bg-background p-3">
-                        <p className="text-[10px] text-muted-foreground mb-0.5">Pitch</p>
-                        <p className="text-base font-bold text-blue-400">
-                          {letterHeight ? `${computedPitch?.toFixed(1)} mm` : `auto`}
-                        </p>
+                        <p className="text-[10px] text-muted-foreground mb-0.5">Pitch Z→XY</p>
+                        <p className="text-base font-bold text-blue-400">{computedPitch.toFixed(1)} mm</p>
                       </div>
                     </div>
                   </div>
                 )}
 
-                {/* ── Detail table ── */}
+                {/* Tabela de detalhe */}
                 {ledSummary && (
                   <div className="rounded-lg border border-border bg-background overflow-hidden">
                     <div className="px-3 py-2 border-b border-border">
@@ -1716,7 +1841,7 @@ export default function NestingApp() {
                       <table className="w-full text-[10px]">
                         <thead>
                           <tr className="border-b border-border">
-                            <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">Dim (mm)</th>
+                            <th className="px-2 py-1.5 text-left font-medium text-muted-foreground">Dim X×Y (mm)</th>
                             <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">Qtd</th>
                             <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">LEDs/pç</th>
                             <th className="px-2 py-1.5 text-right font-medium text-muted-foreground">Total</th>
@@ -1744,7 +1869,7 @@ export default function NestingApp() {
                 )}
               </div>
 
-              {/* ── RIGHT: Canvas ── */}
+              {/* Canvas de visualização LED */}
               <div className="flex flex-1 flex-col overflow-hidden">
                 {!groups.length ? (
                   <div className="flex flex-1 items-center justify-center">
@@ -1760,7 +1885,6 @@ export default function NestingApp() {
                   </div>
                 ) : (
                   <div className="flex flex-1 flex-col overflow-hidden">
-                    {/* Canvas header */}
                     <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-card shrink-0">
                       <div className="flex items-center gap-2">
                         <Zap className="h-3.5 w-3.5 text-yellow-400" />
@@ -1768,14 +1892,13 @@ export default function NestingApp() {
                           Desenho de Posicionamento
                         </span>
                         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${ledEngine === "centerline" ? "bg-yellow-500/20 text-yellow-400" : "bg-blue-500/20 text-blue-400"}`}>
-                          {ledEngine === "centerline" ? "Linha Central" : "Grid"}
+                          {ledEngine === "centerline" ? `Linha Central ×${numCenterlines}` : "Grid"}
                         </span>
                       </div>
                       <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-6 text-[10px] border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
                         <RefreshCw className="h-3 w-3 mr-1" /> Atualizar
                       </Button>
                     </div>
-                    {/* Scrollable canvas area */}
                     <div className="flex-1 overflow-auto p-4">
                       <LedDrawingCanvas
                         key={ledKey}
@@ -1783,10 +1906,9 @@ export default function NestingApp() {
                         ledModels={ledModels}
                         selectedLedId={activeLedForDisplay?.id ?? selectedLedId}
                         ledAssignments={ledAssignments}
-                        borderMargin={0}
-                        letterHeight={letterHeight}
-                        ledRotation={0}
+                        letterThicknessMm={letterThicknessMm}
                         engine={ledEngine}
+                        numCenterlines={numCenterlines}
                       />
                     </div>
                   </div>
@@ -1804,7 +1926,7 @@ export default function NestingApp() {
                 </div>
                 <div>
                   <h2 className="text-sm font-semibold">Cadastro de LEDs</h2>
-                  <p className="text-xs text-muted-foreground">Registre os modelos de LED com foto e dimensões para uso nos cálculos</p>
+                  <p className="text-xs text-muted-foreground">Registre os modelos de LED com dimensões visuais — o cálculo aplica margem de respiro automaticamente</p>
                 </div>
               </div>
               <LedRegistrationPanel
