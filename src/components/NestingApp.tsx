@@ -111,11 +111,16 @@ export interface AiTrainingExample {
 
 function calcPitchFromLetterHeight(
   letterHeight: number,
-  ledW: number,
-  ledH: number,
-): { pitchX: number; pitchY: number } {
-  // área útil interna = espessura da letra - 30%
-  const usable = Math.max(1, letterHeight * 0.7);
+  ledW?: number,
+  ledH?: number,
+): number | { pitchX: number; pitchY: number } {
+  // regra: espessura útil = 70%
+  const usable = letterHeight * 0.7;
+
+  // compatibilidade antiga — sem ledW/ledH retorna escalar
+  if (ledW == null || ledH == null) {
+    return usable;
+  }
 
   return {
     pitchX: Math.max(ledW, usable),
@@ -155,8 +160,12 @@ function calcLedsGrid(
   let pitchY: number;
 
   if (letterHeight && letterHeight > 0) {
-    // Regra: espessura útil da letra = Z - 30%
-    const adaptive = calcPitchFromLetterHeight(letterHeight, ledW, ledH);
+    const adaptive = calcPitchFromLetterHeight(
+      letterHeight,
+      ledW,
+      ledH,
+    ) as { pitchX: number; pitchY: number };
+
     pitchX = adaptive.pitchX;
     pitchY = adaptive.pitchY;
   } else {
@@ -165,18 +174,17 @@ function calcLedsGrid(
     pitchY = ledH > 0 ? ledH : 1;
   }
 
-  // margem dinâmica baseada no pitch atual
+  // (colmeia usa bbox direto de workPoly, não precisa de cols/rows fixos)
+  // margem dinâmica — afasta LEDs da borda
   const insetMargin = Math.min(pitchX, pitchY) * 0.35;
 
-  // cria um polígono interno para evitar LEDs colados na borda
+  // polígono interno (offset para dentro)
   const workPoly = shrinkPolygon(polygon, insetMargin);
 
   const positions: Array<{ x: number; y: number }> = [];
 
   // bbox do polígono interno
-  let wMinX = Infinity, wMinY = Infinity;
-  let wMaxX = -Infinity, wMaxY = -Infinity;
-
+  let wMinX = Infinity, wMinY = Infinity, wMaxX = -Infinity, wMaxY = -Infinity;
   for (const p of workPoly) {
     if (p.x < wMinX) wMinX = p.x;
     if (p.x > wMaxX) wMaxX = p.x;
@@ -184,26 +192,24 @@ function calcLedsGrid(
     if (p.y > wMaxY) wMaxY = p.y;
   }
 
-  // distribuição adaptativa acompanhando o vetor
+  // distribuição adaptativa tipo colmeia (offset em linhas alternadas)
   for (let y = wMinY + pitchY / 2; y <= wMaxY; y += pitchY) {
-    const rowOffset = Math.floor((y - wMinY) / pitchY) % 2 === 0
-      ? 0
-      : pitchX / 2;
+    const rowOffset =
+      Math.floor((y - wMinY) / pitchY) % 2 === 0
+        ? 0
+        : pitchX / 2;
 
     for (let x = wMinX + pitchX / 2 + rowOffset; x <= wMaxX; x += pitchX) {
       const pt = { x, y };
 
+      // dentro do polígono interno
       if (!pointInPoly(pt, workPoly)) continue;
 
+      // ignora furos
       let inHole = false;
-
       for (const hole of holes) {
-        if (pointInPoly(pt, hole)) {
-          inHole = true;
-          break;
-        }
+        if (pointInPoly(pt, hole)) { inHole = true; break; }
       }
-
       if (inHole) continue;
 
       positions.push(pt);
@@ -231,7 +237,7 @@ function calcLedsGrid(
 // Cache de resultados por hash do polígono + ledModel + letterHeight
 const aiLedCache = new Map<string, { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }>();
 
-function polyHash(polygon: Point[], ledModel: LedModel, letterHeight: number | null, rotation: 0 | 90 = 0): string {
+function polyHash(polygon: Point[], ledModel: LedModel, letterHeight: number | null, rotation: 0 | 90): string {
   const pts = polygon.slice(0, 8).map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join("|");
   return `${pts}_${ledModel.width}x${ledModel.height}_lh${letterHeight}_rot${rotation}`;
 }
@@ -264,7 +270,9 @@ async function calcLedsAI(
     : "Nenhum exemplo de treinamento carregado ainda. Use seu conhecimento de luminosos e letras iluminadas.";
 
   const pitchInstr = letterHeight && letterHeight > 0
-    ? `Altura da letra: ${letterHeight}mm → pitch recomendado: ${calcPitchFromLetterHeight(letterHeight).toFixed(1)}mm`
+    ? `Altura da letra: ${letterHeight}mm → pitch recomendado: ${(
+        calcPitchFromLetterHeight(letterHeight, ledModel.width, ledModel.height) as { pitchX: number; pitchY: number }
+      ).pitchX.toFixed(1)}mm`
     : `Sem altura de letra. Use o módulo LED como pitch: ${Math.max(ledModel.width, ledModel.height)}mm`;
 
   const prompt = `Você é um especialista em posicionamento de LEDs em letras e formas para luminosos (letreiros luminosos, fachadas, letras em acrílico/metal).
@@ -397,7 +405,7 @@ function calcLedsForBbox(
 
   let pitchX: number, pitchY: number;
   if (letterHeight && letterHeight > 0) {
-    const adaptive = calcPitchFromLetterHeight(letterHeight, ledModel.width, ledModel.height);
+    const adaptive = calcPitchFromLetterHeight(letterHeight, ledModel.width, ledModel.height) as { pitchX: number; pitchY: number };
     pitchX = adaptive.pitchX;
     pitchY = adaptive.pitchY;
   } else {
@@ -1115,7 +1123,9 @@ function printPlan(
 
   const now = new Date().toLocaleString("pt-BR");
   const totalParts = result.sheets.reduce((s, sh) => s + sh.length, 0);
-  const letterInfo = letterHeight ? `Altura da letra: ${letterHeight}mm · Pitch: ${calcPitchFromLetterHeight(letterHeight).toFixed(1)}mm` : "";
+  const letterInfo = letterHeight ? `Altura da letra: ${letterHeight}mm · Pitch: ${(
+    calcPitchFromLetterHeight(letterHeight, globalLed?.width ?? 1, globalLed?.height ?? 1) as { pitchX: number; pitchY: number }
+  ).pitchX.toFixed(1)}mm` : "";
 
   let html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>Plano de Corte – ${fileName}</title>
@@ -1411,7 +1421,9 @@ export default function NestingApp() {
   const activeLedForDisplay = ledModels.find((l) => l.id === renderedLedId) ?? null;
 
   // Computed pitch display
-  const computedPitch = letterHeight && letterHeight > 0 ? calcPitchFromLetterHeight(letterHeight) : null;
+  const computedPitch = letterHeight && letterHeight > 0 && selectedLed
+    ? (calcPitchFromLetterHeight(letterHeight, selectedLed.width, selectedLed.height) as { pitchX: number; pitchY: number }).pitchX
+    : null;
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
@@ -1791,14 +1803,14 @@ export default function NestingApp() {
                       }}
                       className="h-7 text-xs flex-1"
                     />
-                    {letterHeight && letterHeight > 0 && (
+                    {letterHeight && letterHeight > 0 && selectedLed && (
                       <div className="text-[10px] text-yellow-300 font-mono whitespace-nowrap">
-                        → <strong>{calcPitchFromLetterHeight(letterHeight).toFixed(1)} mm</strong>
+                        → <strong>{(calcPitchFromLetterHeight(letterHeight, selectedLed.width, selectedLed.height) as { pitchX: number; pitchY: number }).pitchX.toFixed(1)} mm</strong>
                       </div>
                     )}
                   </div>
                   <p className="text-[9px] text-yellow-400/70">
-                    Com altura: pitch = altura × 0,85 · Sem altura: pitch = largura do módulo (modW)
+                    Com altura: pitch = max(modW, altura×0,70) · Sem altura: pitch = dimensão do módulo LED
                   </p>
                 </div>
 
