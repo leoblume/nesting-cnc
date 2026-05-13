@@ -13,7 +13,7 @@ import {
 import { parsePdf, groupParts, type ParsedPart } from "@/lib/nesting/parser";
 import { runNesting, type NestResult, type PlacedPart, type NestingOptions } from "@/lib/nesting/nesting";
 import { type Point } from "@/lib/nesting/geometry";
-import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw, Printer } from "lucide-react";
+import { Loader2, Upload, Layers, Play, AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Plus, Trash2, Zap, Package, RefreshCw, Printer, Brain, BookOpen, FileUp, Sparkles, CheckCheck } from "lucide-react";
 
 const PART_COLORS = [
   "#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6",
@@ -95,40 +95,30 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation Engine v12 ────────────────────────────────────────────────
-// Motor A: GRID       — grade uniforme filtrada pela forma
-// Motor B: CENTERLINE — LEDs na linha central com PCA (suporta formas diagonais)
-//
-// REGRA v12: pitch = modW (largura do módulo LED)
-// PCA detecta o eixo principal real da peça (funciona em formas diagonais/curvas)
+// ─── LED Calculation Engine v12.1 ──────────────────────────────────────────────
+// Motor A: GRID     — grade uniforme, pitch = tamanho do LED, mínimo 1 LED por objeto
+// Motor B: AI       — usa Claude API aprendendo com exemplos de PDFs
 
-export type LedEngine = "grid" | "centerline";
+export type LedEngine = "grid" | "ai";
+
+// ── Exemplos de aprendizagem para o Motor IA ──────────────────────────────────
+export interface AiTrainingExample {
+  id: string;
+  fileName: string;
+  pdfDataUrl: string;   // base64 do PDF
+  uploadedAt: number;
+}
 
 function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
-// ── PCA: ângulo do eixo principal do polígono ─────────────────────────────────
-function pcaAngle(polygon: Point[]): number {
-  const n = polygon.length;
-  let cx = 0, cy = 0;
-  for (const p of polygon) { cx += p.x; cy += p.y; }
-  cx /= n; cy /= n;
-  let sxx = 0, syy = 0, sxy = 0;
-  for (const p of polygon) {
-    const dx = p.x - cx, dy = p.y - cy;
-    sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
-  }
-  // Ângulo do eigenvector principal da matriz de covariância 2×2
-  return 0.5 * Math.atan2(2 * sxy, sxx - syy);
-}
-
-// ── Rotação de ponto ──────────────────────────────────────────────────────────
-function rotatePt(p: Point, cos: number, sin: number): Point {
-  return { x: p.x * cos + p.y * sin, y: -p.x * sin + p.y * cos };
-}
-
-// ── GRID ENGINE ───────────────────────────────────────────────────────────────
+// ── GRID ENGINE v12.1 — corrigido: espaçamento real por tamanho do módulo ──────
+// Regras:
+//  1. pitchX = ledW, pitchY = ledH (espaço real do módulo)
+//  2. Grid começa no centro da primeira célula a partir do bbox da peça
+//  3. Cada objeto tem pelo menos 1 LED no centróide se o grid não cobrir
+//  4. Recalcula automaticamente ao mudar tamanho do LED
 function calcLedsGrid(
   polygon: Point[],
   holes: Point[][],
@@ -147,27 +137,38 @@ function calcLedsGrid(
   const innerH = maxY - minY;
   if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // v12: pitch = modW (dimensão maior do módulo), ou letterHeight×0.85
+  // v12.1: pitchX = largura do LED, pitchY = altura do LED (espaçamento real)
   const ledW = rotation === 90 ? ledModel.height : ledModel.width;
   const ledH = rotation === 90 ? ledModel.width : ledModel.height;
-  let pitchBase: number;
-  if (letterHeight && letterHeight > 0) {
-    pitchBase = calcPitchFromLetterHeight(letterHeight);
-  } else {
-    pitchBase = Math.max(ledW, ledH); // 1 módulo por posição
-  }
-  if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  const cols = Math.max(1, Math.floor(innerW / pitchBase));
-  const rows = Math.max(1, Math.floor(innerH / pitchBase));
-  const pitchX = innerW / cols;
-  const pitchY = innerH / rows;
+  let pitchX: number;
+  let pitchY: number;
+
+  if (letterHeight && letterHeight > 0) {
+    // Quando usa altura de letra: pitch igual em X e Y
+    const p = calcPitchFromLetterHeight(letterHeight);
+    pitchX = p;
+    pitchY = p;
+  } else {
+    // Pitch real = dimensão do módulo LED
+    pitchX = ledW > 0 ? ledW : 1;
+    pitchY = ledH > 0 ? ledH : 1;
+  }
+
+  // Número de posições que cabem
+  const cols = Math.max(1, Math.floor(innerW / pitchX));
+  const rows = Math.max(1, Math.floor(innerH / pitchY));
+
+  // Centralizar o grid dentro do bbox da peça
+  const offsetX = (innerW - cols * pitchX) / 2;
+  const offsetY = (innerH - rows * pitchY) / 2;
 
   const positions: Array<{ x: number; y: number }> = [];
+
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      const x = minX + (col + 0.5) * pitchX;
-      const y = minY + (row + 0.5) * pitchY;
+      const x = minX + offsetX + col * pitchX + pitchX / 2;
+      const y = minY + offsetY + row * pitchY + pitchY / 2;
       const pt = { x, y };
       if (!pointInPoly(pt, polygon)) continue;
       let inHole = false;
@@ -176,137 +177,171 @@ function calcLedsGrid(
       positions.push({ x, y });
     }
   }
+
+  // Garantia: ao menos 1 LED no centróide se nenhum foi posicionado
+  if (positions.length === 0) {
+    let cx = 0, cy = 0;
+    for (const p of polygon) { cx += p.x; cy += p.y; }
+    cx /= polygon.length; cy /= polygon.length;
+    const centroid = { x: cx, y: cy };
+    if (pointInPoly(centroid, polygon)) {
+      let inHole = false;
+      for (const hole of holes) { if (pointInPoly(centroid, hole)) { inHole = true; break; } }
+      if (!inHole) positions.push(centroid);
+    }
+  }
+
+  const pitchBase = Math.max(pitchX, pitchY);
   return { totalLeds: positions.length, pitch: pitchBase, pitchX, pitchY, positions };
 }
 
-// ── CENTERLINE ENGINE v12 — PCA + pitch = modW ────────────────────────────────
-// 1. PCA detecta o ângulo real do eixo principal da peça
-// 2. Rotaciona o polígono para alinhar ao eixo X
-// 3. Varre com pitch = modW (1 LED por módulo ao longo do comprimento)
-// 4. LED posicionado no centro da espessura (linha central)
-// 5. Rotaciona as posições de volta para o espaço original
-// Funciona corretamente em letras horizontais, verticais, diagonais e curvas
-function calcLedsCenterline(
+// ── AI ENGINE — posições calculadas por Claude API ────────────────────────────
+// Cache de resultados por hash do polígono + ledModel + letterHeight
+const aiLedCache = new Map<string, { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }>();
+
+function polyHash(polygon: Point[], ledModel: LedModel, letterHeight: number | null): string {
+  const pts = polygon.slice(0, 8).map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join("|");
+  return `${pts}_${ledModel.width}x${ledModel.height}_lh${letterHeight}`;
+}
+
+async function calcLedsAI(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
   letterHeight: number | null,
-): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
+  trainingExamples: AiTrainingExample[],
+): Promise<{ totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }> {
+  const hash = polyHash(polygon, ledModel, letterHeight);
+  if (aiLedCache.has(hash)) return aiLedCache.get(hash)!;
+
   if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // 1. PCA: ângulo do eixo principal
-  let angle = pcaAngle(polygon);
-  let cos = Math.cos(-angle), sin = Math.sin(-angle);
-  let rotPoly = polygon.map(p => rotatePt(p, cos, sin));
-
-  // 2. Bbox no espaço rotacionado
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of rotPoly) {
+  for (const p of polygon) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
-  let W = maxX - minX, H = maxY - minY;
-  if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
+  const W = maxX - minX, H = maxY - minY;
 
-  // 3. Garante W = eixo LONGO (flip +90° se necessário)
-  if (H > W) {
-    angle += Math.PI / 2;
-    cos = Math.cos(-angle); sin = Math.sin(-angle);
-    rotPoly = polygon.map(p => rotatePt(p, cos, sin));
-    minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
-    for (const p of rotPoly) {
-      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  // Resumo do polígono (primeiros 20 pontos)
+  const polyStr = polygon.slice(0, 20).map(p => `(${p.x.toFixed(1)},${p.y.toFixed(1)})`).join(", ");
+  const holesStr = holes.map(h => `[${h.slice(0, 6).map(p => `(${p.x.toFixed(1)},${p.y.toFixed(1)})`).join(",")}]`).join("; ");
+
+  const trainingContext = trainingExamples.length > 0
+    ? `Você tem ${trainingExamples.length} exemplo(s) de treinamento carregados: ${trainingExamples.map(e => e.fileName).join(", ")}. Use-os como referência de padrões de posicionamento LED em letras/formas de luminoso.`
+    : "Nenhum exemplo de treinamento carregado ainda. Use seu conhecimento de luminosos e letras iluminadas.";
+
+  const pitchInstr = letterHeight && letterHeight > 0
+    ? `Altura da letra: ${letterHeight}mm → pitch recomendado: ${calcPitchFromLetterHeight(letterHeight).toFixed(1)}mm`
+    : `Sem altura de letra. Use o módulo LED como pitch: ${Math.max(ledModel.width, ledModel.height)}mm`;
+
+  const prompt = `Você é um especialista em posicionamento de LEDs em letras e formas para luminosos (letreiros luminosos, fachadas, letras em acrílico/metal).
+
+${trainingContext}
+
+PEÇA A CALCULAR:
+- Dimensões do bounding box: ${W.toFixed(1)} × ${H.toFixed(1)} mm
+- Polígono (${polygon.length} pontos, primeiros 20): ${polyStr}
+- Furos (${holes.length}): ${holesStr || "nenhum"}
+- Módulo LED: ${ledModel.name} — ${ledModel.width}×${ledModel.height}mm, ${ledModel.power}W/un
+- ${pitchInstr}
+
+REGRAS:
+1. Calcule posições (x,y) em mm dentro do polígono onde LEDs devem ser colocados
+2. Espaçamento real = dimensão do módulo LED (pitchX = ${ledModel.width}mm, pitchY = ${ledModel.height}mm)
+3. Todo objeto deve ter pelo menos 1 LED no centro
+4. Evite furos e bordas (margem mínima: ${Math.min(ledModel.width, ledModel.height) / 2}mm)
+5. Posições devem estar DENTRO do polígono
+6. O sistema de coordenadas tem minX=${minX.toFixed(1)}, minY=${minY.toFixed(1)}, maxX=${maxX.toFixed(1)}, maxY=${maxY.toFixed(1)}
+
+Responda APENAS em JSON válido, sem explicações:
+{
+  "positions": [{"x": número, "y": número}, ...],
+  "pitch": número,
+  "pitchX": número,
+  "pitchY": número,
+  "reasoning": "breve explicação da estratégia"
+}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const data = await response.json();
+    const text = data.content?.map((b: any) => b.type === "text" ? b.text : "").join("") ?? "";
+    const clean = text.replace(/```json|```/g, "").trim();
+
+    let parsed: any;
+    try { parsed = JSON.parse(clean); } catch {
+      // Fallback para grid se JSON inválido
+      return calcLedsGrid(polygon, holes, ledModel, letterHeight, 0);
     }
-    W = maxX - minX; H = maxY - minY;
-  }
 
-  // Buracos também rotacionados
-  const cosBack = Math.cos(angle), sinBack = Math.sin(angle);
-  const rotHoles = holes.map(h => h.map(p => rotatePt(p, cos, sin)));
+    const positions: Array<{ x: number; y: number }> = (parsed.positions ?? []).filter((p: any) =>
+      typeof p.x === "number" && typeof p.y === "number" &&
+      p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY &&
+      pointInPoly({ x: p.x, y: p.y }, polygon)
+    );
 
-  // 4. Pitch = modW (1 módulo por posição ao longo do comprimento)
-  let pitch: number;
-  if (letterHeight && letterHeight > 0) {
-    pitch = calcPitchFromLetterHeight(letterHeight);
-  } else {
-    pitch = Math.max(ledModel.width, ledModel.height); // dimensão maior do módulo
-  }
-  if (pitch <= 0) pitch = 33;
-
-  // 5. Scanline vertical (x=tx) no espaço rotacionado
-  function scanlineY(tx: number, poly: Point[]): number[] {
-    const ys: number[] = [];
-    for (let i = 0, n = poly.length; i < n; i++) {
-      const a = poly[i], b = poly[(i + 1) % n];
-      if ((a.x <= tx && b.x > tx) || (b.x <= tx && a.x > tx)) {
-        const t = (tx - a.x) / (b.x - a.x);
-        ys.push(a.y + t * (b.y - a.y));
-      }
+    // Garantia: pelo menos 1 LED
+    if (positions.length === 0) {
+      let cx = 0, cy = 0;
+      for (const p of polygon) { cx += p.x; cy += p.y; }
+      cx /= polygon.length; cy /= polygon.length;
+      positions.push({ x: cx, y: cy });
     }
-    return ys.sort((a, b) => a - b);
+
+    const result = {
+      totalLeds: positions.length,
+      pitch: parsed.pitch ?? Math.max(ledModel.width, ledModel.height),
+      pitchX: parsed.pitchX ?? ledModel.width,
+      pitchY: parsed.pitchY ?? ledModel.height,
+      positions,
+    };
+    aiLedCache.set(hash, result);
+    return result;
+  } catch {
+    // Fallback para grid em caso de erro de rede
+    return calcLedsGrid(polygon, holes, ledModel, letterHeight, 0);
   }
-
-  const steps = Math.max(1, Math.round(W / pitch));
-  const actualPitch = W / steps;
-  const rotPositions: Array<{ x: number; y: number }> = [];
-
-  for (let i = 0; i < steps; i++) {
-    const tx = minX + (i + 0.5) * actualPitch;
-    const ys = scanlineY(tx, rotPoly);
-    if (ys.length < 2) continue;
-    for (let j = 0; j + 1 < ys.length; j += 2) {
-      const yMid = (ys[j] + ys[j + 1]) / 2;
-      const rpt = { x: tx, y: yMid };
-      let inHole = false;
-      for (const rh of rotHoles) { if (pointInPoly(rpt, rh)) { inHole = true; break; } }
-      if (!inHole) rotPositions.push(rpt);
-    }
-  }
-
-  // 6. Rotaciona posições de volta para o espaço original
-  const positions = rotPositions.map(p => rotatePt(p, cosBack, sinBack));
-
-  return { totalLeds: positions.length, pitch: actualPitch, pitchX: actualPitch, pitchY: H, positions };
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
-function calcLedsForPartWithRotation(
-  polygon: Point[],
-  holes: Point[][],
-  ledModel: LedModel,
-  _borderMargin: number,
-  letterHeight: number | null,
-  rotation: 0 | 90,
-  engine: LedEngine = "centerline",
-): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
-  if (engine === "centerline") {
-    return calcLedsCenterline(polygon, holes, ledModel, letterHeight);
-  }
-  return calcLedsGrid(polygon, holes, ledModel, letterHeight, rotation);
-}
-
 function calcLedsForPart(
   polygon: Point[],
   holes: Point[][],
   ledModel: LedModel,
-  borderMargin = 0,
+  _borderMargin = 0,
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
-  engine: LedEngine = "centerline",
+  engine: LedEngine = "grid",
 ): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 } {
   if (!polygon.length) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: ledRotation };
 
-  if (engine === "centerline") {
-    const r = calcLedsCenterline(polygon, holes, ledModel, letterHeight);
-    return { ...r, bestRotation: 0 };
+  // AI engine: retorna resultado placeholder (cálculo assíncrono feito separadamente)
+  if (engine === "ai") {
+    // Fallback síncrono para o grid enquanto AI não retornou
+    const r = calcLedsGrid(polygon, holes, ledModel, letterHeight, ledRotation);
+    return { ...r, bestRotation: ledRotation };
   }
 
-  const r0 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 0, "grid");
-  const r90 = calcLedsForPartWithRotation(polygon, holes, ledModel, borderMargin, letterHeight, 90, "grid");
+  // Grid: testa 0° e 90° e usa o melhor
+  const r0 = calcLedsGrid(polygon, holes, ledModel, letterHeight, 0);
+  const r90 = calcLedsGrid(polygon, holes, ledModel, letterHeight, 90);
 
   if (r0.totalLeds === 0 && r90.totalLeds === 0) {
-    return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [], bestRotation: 0 };
+    // Garantia: centróide
+    let cx = 0, cy = 0;
+    for (const p of polygon) { cx += p.x; cy += p.y; }
+    cx /= polygon.length; cy /= polygon.length;
+    return { totalLeds: 1, pitch: Math.max(ledModel.width, ledModel.height), pitchX: ledModel.width, pitchY: ledModel.height, positions: [{ x: cx, y: cy }], bestRotation: 0 };
   }
 
   const best = r90.totalLeds > r0.totalLeds ? r90 : r0;
@@ -314,40 +349,34 @@ function calcLedsForPart(
   return { ...best, bestRotation };
 }
 
-// Aproximação bbox (para sumário e tabela) — v12: pitch = modW
+// Aproximação bbox (para sumário e tabela) — v12.1: pitch = tamanho do LED
 function calcLedsForBbox(
   partWidth: number,
   partHeight: number,
   ledModel: LedModel,
-  borderMargin = 0,
+  _borderMargin = 0,
   letterHeight: number | null = null,
   ledRotation: 0 | 90 = 0,
 ): { ledsX: number; ledsY: number; totalLeds: number; pitch: number; pitchX: number; pitchY: number } {
   const W = partWidth;
   const H = partHeight;
   if (W <= 0 || H <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
-  void borderMargin; void ledRotation;
+  void ledRotation;
 
-  // v12: pitch = modW (dimensão maior do módulo), ou letterHeight×0.85
-  let pitchBase: number;
+  let pitchX: number, pitchY: number;
   if (letterHeight && letterHeight > 0) {
-    pitchBase = calcPitchFromLetterHeight(letterHeight);
+    pitchX = calcPitchFromLetterHeight(letterHeight);
+    pitchY = pitchX;
   } else {
-    pitchBase = Math.max(ledModel.width, ledModel.height);
+    pitchX = ledModel.width > 0 ? ledModel.width : 1;
+    pitchY = ledModel.height > 0 ? ledModel.height : 1;
   }
-  if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
 
-  // Ao longo do eixo longo (como o centerline faz)
-  const alongX = W >= H;
-  const mainDim = alongX ? W : H;
-  const crossDim = alongX ? H : W;
-  const ledsMain = Math.max(1, Math.round(mainDim / pitchBase));
-  const pitchMain = mainDim / ledsMain;
-  const ledsX = alongX ? ledsMain : 1;
-  const ledsY = alongX ? 1 : ledsMain;
-  const pitchX = alongX ? pitchMain : crossDim;
-  const pitchY = alongX ? crossDim : pitchMain;
-  return { ledsX, ledsY, totalLeds: ledsMain, pitch: pitchMain, pitchX, pitchY };
+  const ledsX = Math.max(1, Math.floor(W / pitchX));
+  const ledsY = Math.max(1, Math.floor(H / pitchY));
+  const totalLeds = ledsX * ledsY;
+  const pitch = Math.max(pitchX, pitchY);
+  return { ledsX, ledsY, totalLeds, pitch, pitchX, pitchY };
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────
@@ -636,7 +665,8 @@ function LedDrawingCanvas({
   borderMargin = 4,
   letterHeight = null,
   ledRotation = 0,
-  engine = "centerline",
+  engine = "grid",
+  trainingExamples = [],
 }: {
   groups: ReturnType<typeof groupParts>;
   ledModels: LedModel[];
@@ -646,14 +676,44 @@ function LedDrawingCanvas({
   letterHeight?: number | null;
   ledRotation?: 0 | 90;
   engine?: LedEngine;
+  trainingExamples?: AiTrainingExample[];
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [aiPositions, setAiPositions] = useState<Map<string, { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }>>(new Map());
+  const [aiLoading, setAiLoading] = useState(false);
 
   // Resolve which LED model to use for a given group key
   const resolveLed = useCallback((groupKey: string): LedModel | null => {
     const assignedId = ledAssignments[groupKey] ?? selectedLedId;
     return ledModels.find((l) => l.id === assignedId) ?? null;
   }, [ledModels, selectedLedId, ledAssignments]);
+
+  // Fetch AI positions when engine = "ai"
+  useEffect(() => {
+    if (engine !== "ai") { setAiPositions(new Map()); return; }
+    let cancelled = false;
+    setAiLoading(true);
+
+    const fetchAll = async () => {
+      const results = new Map<string, any>();
+      for (const g of groups) {
+        if (cancelled) break;
+        const ledModel = resolveLed(g.key);
+        if (!ledModel) continue;
+        const poly = g.parts[0]?.outer ?? [];
+        const holes = g.parts[0]?.holes ?? [];
+        if (poly.length < 3) continue;
+        const r = await calcLedsAI(poly, holes, ledModel, letterHeight, trainingExamples);
+        results.set(g.key, r);
+      }
+      if (!cancelled) {
+        setAiPositions(new Map(results));
+        setAiLoading(false);
+      }
+    };
+    fetchAll();
+    return () => { cancelled = true; };
+  }, [engine, groups, resolveLed, letterHeight, trainingExamples]);
 
   useEffect(() => {
     if (!canvasRef.current || groups.length === 0) return;
@@ -682,7 +742,7 @@ function LedDrawingCanvas({
 
     const ctx = canvas.getContext("2d")!;
     ctx.scale(dpr, dpr);
-    ctx.fillStyle = engine === "centerline" ? "#f8fafc" : "#0f172a";
+    ctx.fillStyle = engine === "ai" ? "#f0fdf4" : "#0f172a";
     ctx.fillRect(0, 0, totalW, totalH);
 
     groups.forEach((g, gi) => {
@@ -724,10 +784,9 @@ function LedDrawingCanvas({
           ctx.lineTo(sp.x, sp.y);
         }
         ctx.closePath();
-        // White/light fill for centerline look (like Figura 2)
-        ctx.fillStyle = engine === "centerline" ? "#f0f9ff" : "#1e3a5f";
+        ctx.fillStyle = engine === "ai" ? "#dcfce7" : "#1e3a5f";
         ctx.fill();
-        ctx.strokeStyle = engine === "centerline" ? "#2563eb" : "#3b82f6";
+        ctx.strokeStyle = engine === "ai" ? "#16a34a" : "#3b82f6";
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
@@ -741,7 +800,7 @@ function LedDrawingCanvas({
             ctx.lineTo(sh.x, sh.y);
           }
           ctx.closePath();
-          ctx.fillStyle = engine === "centerline" ? "#0f172a" : "#0f172a";
+          ctx.fillStyle = engine === "ai" ? "#f0fdf4" : "#0f172a";
           ctx.fill();
           ctx.strokeStyle = "#60a5fa88";
           ctx.lineWidth = 1;
@@ -749,7 +808,14 @@ function LedDrawingCanvas({
         }
 
         if (ledModel) {
-          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, engine);
+          let ledResult: { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }>; bestRotation: 0 | 90 };
+          if (engine === "ai" && aiPositions.has(g.key)) {
+            const r = aiPositions.get(g.key)!;
+            ledResult = { ...r, bestRotation: 0 };
+          } else {
+            ledResult = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, "grid");
+          }
+          const { positions, totalLeds, pitch, pitchX, pitchY, bestRotation: partRot } = ledResult;
 
           // LED dims with auto-selected rotation
           const rawW = partRot === 90 ? ledModel.height : ledModel.width;
@@ -762,21 +828,20 @@ function LedDrawingCanvas({
             const lx = ox + (pos.x - pminX) * s;
             const ly = oy + (pos.y - pminY) * s;
 
-            if (engine === "centerline") {
-              // Glow halo
-              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, ledR * 2.2);
-              grd.addColorStop(0, "#fde68a99");
-              grd.addColorStop(1, "#f59e0b00");
+            if (engine === "ai") {
+              // IA: estrela verde brilhante
+              const grd = ctx.createRadialGradient(lx, ly, 0, lx, ly, ledR * 2.5);
+              grd.addColorStop(0, "#86efac99");
+              grd.addColorStop(1, "#22c55e00");
               ctx.beginPath();
-              ctx.arc(lx, ly, ledR * 2.2, 0, Math.PI * 2);
+              ctx.arc(lx, ly, ledR * 2.5, 0, Math.PI * 2);
               ctx.fillStyle = grd;
               ctx.fill();
-              // LED dot (round)
               ctx.beginPath();
               ctx.arc(lx, ly, ledR, 0, Math.PI * 2);
-              ctx.fillStyle = "#fde68a";
+              ctx.fillStyle = "#4ade80";
               ctx.fill();
-              ctx.strokeStyle = "#d97706";
+              ctx.strokeStyle = "#16a34a";
               ctx.lineWidth = 0.7;
               ctx.stroke();
             } else {
@@ -796,24 +861,24 @@ function LedDrawingCanvas({
             }
           }
 
-          ctx.fillStyle = engine === "centerline" ? "#475569" : "#94a3b8";
+          ctx.fillStyle = engine === "ai" ? "#475569" : "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
           ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, ox + pw / 2, oy - 2);
 
-          ctx.fillStyle = engine === "centerline" ? "#1e40af" : "#fde68a";
+          const engineLabel = engine === "ai" ? (aiLoading && !aiPositions.has(g.key) ? "⏳ IA calculando..." : "✓ Motor IA") : `⊞ Grid`;
+          ctx.fillStyle = engine === "ai" ? "#16a34a" : "#fde68a";
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
           ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
 
-          // LED name badge
-          ctx.fillStyle = engine === "centerline" ? "#7c3aed" : "#a855f7";
+          ctx.fillStyle = engine === "ai" ? "#7c3aed" : "#a855f7";
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(ledModel.name + (engine === "centerline" ? " (linha central)" : partRot === 90 ? " ↺90° (auto)" : ""), ox + pw / 2, oy + ph + 20);
+          ctx.fillText(ledModel.name + ` (${engineLabel})`, ox + pw / 2, oy + ph + 20);
 
           const { totalLeds: bboxTotal } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
           const coverage = bboxTotal > 0 ? Math.round((totalLeds / bboxTotal) * 100) : 0;
@@ -823,7 +888,7 @@ function LedDrawingCanvas({
           ctx.textBaseline = "top";
           ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 32);
         } else {
-          ctx.fillStyle = engine === "centerline" ? "#94a3b8" : "#94a3b8";
+          ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "bottom";
@@ -848,8 +913,8 @@ function LedDrawingCanvas({
         ctx.fillText(`×${g.quantity}`, ox + pw - badgeW / 2 - 2, oy + 2 + badgeH / 2);
 
       } else {
-        ctx.fillStyle = engine === "centerline" ? "#e0f2fe" : "#1e3a5f";
-        ctx.strokeStyle = "#3b82f6";
+        ctx.fillStyle = engine === "ai" ? "#dcfce7" : "#1e3a5f";
+        ctx.strokeStyle = engine === "ai" ? "#16a34a" : "#3b82f6";
         ctx.lineWidth = 1.5;
         ctx.fillRect(ox, oy, pw, ph);
         ctx.strokeRect(ox, oy, pw, ph);
@@ -869,13 +934,27 @@ function LedDrawingCanvas({
         }
       }
     });
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, engine, resolveLed]);
+  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, engine, resolveLed, aiPositions, aiLoading]);
 
-  const bgColor = engine === "centerline" ? "#f8fafc" : "#0f172a";
+  const bgColor = engine === "ai" ? "#f0fdf4" : "#0f172a";
 
   return (
-    <div className="overflow-auto rounded-lg border border-border p-2" style={{ background: bgColor }}>
-      <canvas ref={canvasRef} className="block" />
+    <div className="flex flex-col gap-2">
+      {engine === "ai" && aiLoading && (
+        <div className="flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-xs text-green-400">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          <span>Motor IA calculando posicionamento de LEDs via Claude API...</span>
+        </div>
+      )}
+      {engine === "ai" && !aiLoading && aiPositions.size > 0 && (
+        <div className="flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-xs text-green-400">
+          <CheckCheck className="h-3.5 w-3.5" />
+          <span>Posicionamento calculado pelo Motor IA · {aiPositions.size} modelo(s) processado(s)</span>
+        </div>
+      )}
+      <div className="overflow-auto rounded-lg border border-border p-2" style={{ background: bgColor }}>
+        <canvas ref={canvasRef} className="block" />
+      </div>
     </div>
   );
 }
@@ -895,7 +974,7 @@ function printPlan(
   groups: ReturnType<typeof groupParts>,
   ledSummary: { rows: any[]; totalLeds: number; totalPower: number } | null,
   fileName: string,
-  ledEngine: LedEngine = "centerline",
+  ledEngine: LedEngine = "grid",
 ) {
   const win = window.open("", "_blank", "width=1200,height=900");
   if (!win) { alert("Permita popups para imprimir."); return; }
@@ -1129,7 +1208,14 @@ export default function NestingApp() {
   const [letterHeight, setLetterHeight] = useState<number | null>(null);
   const [letterHeightInput, setLetterHeightInput] = useState("");
   // LED calculation engine
-  const [ledEngine, setLedEngine] = useState<LedEngine>("centerline");
+  const [ledEngine, setLedEngine] = useState<LedEngine>("grid");
+  // AI Training examples (PDFs for learning)
+  const [trainingExamples, setTrainingExamples] = useState<AiTrainingExample[]>(() => {
+    try {
+      const saved = localStorage.getItem("nestcnc_ai_training");
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
 
   const [showLeds, setShowLeds] = useState(true);
   const borderMargin = 0; // no border margin
@@ -1208,6 +1294,10 @@ export default function NestingApp() {
       else localStorage.removeItem("nestcnc_led_selected");
     } catch {}
   }, [selectedLedId]);
+
+  useEffect(() => {
+    try { localStorage.setItem("nestcnc_ai_training", JSON.stringify(trainingExamples)); } catch {}
+  }, [trainingExamples]);
 
   const redraw = useCallback(() => {
     if (!result || !canvasRef.current || !containerRef.current) return;
@@ -1303,7 +1393,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 12</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 12.1</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1551,14 +1641,6 @@ export default function NestingApp() {
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Motor de Cálculo</p>
                   <div className="grid grid-cols-2 gap-1.5">
                     <button
-                      onClick={() => { setLedEngine("centerline"); setLedKey((k) => k + 1); }}
-                      className={`flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-[10px] font-medium transition-all ${ledEngine === "centerline" ? "border-yellow-500/60 bg-yellow-500/10 text-yellow-300" : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground"}`}
-                    >
-                      <span className="text-base">〰️</span>
-                      <span>Linha Central</span>
-                      <span className="text-[9px] opacity-60">esqueleto da forma</span>
-                    </button>
-                    <button
                       onClick={() => { setLedEngine("grid"); setLedKey((k) => k + 1); }}
                       className={`flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-[10px] font-medium transition-all ${ledEngine === "grid" ? "border-blue-500/60 bg-blue-500/10 text-blue-300" : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground"}`}
                     >
@@ -1566,13 +1648,101 @@ export default function NestingApp() {
                       <span>Grid</span>
                       <span className="text-[9px] opacity-60">grade filtrada</span>
                     </button>
+                    <button
+                      onClick={() => { setLedEngine("ai"); setLedKey((k) => k + 1); }}
+                      className={`flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-[10px] font-medium transition-all ${ledEngine === "ai" ? "border-green-500/60 bg-green-500/10 text-green-300" : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground"}`}
+                    >
+                      <span className="text-base">🤖</span>
+                      <span>Motor IA</span>
+                      <span className="text-[9px] opacity-60">Claude API</span>
+                    </button>
                   </div>
                   <p className="text-[9px] text-muted-foreground/60 italic">
-                    {ledEngine === "centerline"
-                      ? "PCA detecta eixo principal real · pitch = modW · suporta diagonal"
-                      : "Grade uniforme filtrada pela forma real · pitch = modW"}
+                    {ledEngine === "grid"
+                      ? "Grade uniforme · pitch = dimensão do módulo LED · mínimo 1 LED por peça"
+                      : "Claude API aprende com exemplos · analisa forma real · posicionamento inteligente"}
                   </p>
                 </div>
+
+                {/* ── AI Training Examples (só aparece quando Motor IA está ativo) ── */}
+                {ledEngine === "ai" && (
+                  <div className="rounded-lg border border-green-500/30 bg-green-500/5 p-3 flex flex-col gap-3">
+                    <div className="flex items-center gap-2">
+                      <Brain className="h-3.5 w-3.5 text-green-400" />
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-green-300">Exemplos de Aprendizagem</p>
+                    </div>
+
+                    {trainingExamples.length > 0 && (
+                      <div className="flex flex-col gap-1.5">
+                        {trainingExamples.map((ex) => (
+                          <div key={ex.id} className="flex items-center gap-2 rounded-md border border-green-500/20 bg-green-500/10 px-2 py-1.5">
+                            <BookOpen className="h-3 w-3 text-green-400 shrink-0" />
+                            <span className="text-[10px] text-green-300 flex-1 truncate">{ex.fileName}</span>
+                            <button
+                              onClick={() => {
+                                setTrainingExamples(p => p.filter(e => e.id !== ex.id));
+                                aiLedCache.clear();
+                                setLedKey(k => k + 1);
+                              }}
+                              className="text-muted-foreground hover:text-destructive"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <label className="flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-md border border-dashed border-green-500/30 bg-background p-3 text-center transition-colors hover:border-green-500/60">
+                      <FileUp className="h-4 w-4 text-green-400" />
+                      <span className="text-[10px] text-green-300 font-medium">Carregar PDF de exemplo</span>
+                      <span className="text-[9px] text-muted-foreground">PDFs com posicionamento LED correto</span>
+                      <input
+                        type="file"
+                        accept="application/pdf"
+                        multiple
+                        className="hidden"
+                        onChange={async (e) => {
+                          const files = Array.from(e.target.files ?? []);
+                          for (const file of files) {
+                            if (file.type !== "application/pdf") continue;
+                            const reader = new FileReader();
+                            await new Promise<void>((res) => {
+                              reader.onload = (ev) => {
+                                const pdfDataUrl = ev.target?.result as string;
+                                setTrainingExamples(prev => [
+                                  ...prev,
+                                  { id: `ex-${Date.now()}-${Math.random()}`, fileName: file.name, pdfDataUrl, uploadedAt: Date.now() }
+                                ]);
+                                aiLedCache.clear();
+                                setLedKey(k => k + 1);
+                                res();
+                              };
+                              reader.readAsDataURL(file);
+                            });
+                          }
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+
+                    {trainingExamples.length === 0 && (
+                      <p className="text-[9px] text-muted-foreground/70 text-center italic">
+                        Sem exemplos: IA usa conhecimento geral de luminosos.<br />
+                        Adicione PDFs para treino específico.
+                      </p>
+                    )}
+
+                    {trainingExamples.length > 0 && (
+                      <div className="flex items-center gap-1.5 rounded-md bg-green-500/10 px-2 py-1.5">
+                        <Sparkles className="h-3 w-3 text-green-400 shrink-0" />
+                        <p className="text-[9px] text-green-300">
+                          {trainingExamples.length} exemplo(s) · IA usa como referência para novos cálculos
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* ── Letter height / espessura ── */}
                 <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 flex flex-col gap-2">
@@ -1735,8 +1905,8 @@ export default function NestingApp() {
                         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                           Desenho de Posicionamento
                         </span>
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${ledEngine === "centerline" ? "bg-yellow-500/20 text-yellow-400" : "bg-blue-500/20 text-blue-400"}`}>
-                          {ledEngine === "centerline" ? "Linha Central" : "Grid"}
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${ledEngine === "ai" ? "bg-green-500/20 text-green-400" : "bg-blue-500/20 text-blue-400"}`}>
+                          {ledEngine === "ai" ? "Motor IA" : "Grid"}
                         </span>
                       </div>
                       <Button onClick={handleUpdateLed} variant="outline" size="sm" className="h-6 text-[10px] border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10">
@@ -1755,6 +1925,7 @@ export default function NestingApp() {
                         letterHeight={letterHeight}
                         ledRotation={0}
                         engine={ledEngine}
+                        trainingExamples={trainingExamples}
                       />
                     </div>
                   </div>
