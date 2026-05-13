@@ -95,22 +95,37 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation Engine ────────────────────────────────────────────────────
-// Motor A: GRID  — grade uniforme filtrada pela forma
-// Motor B: CENTERLINE — LEDs ao longo da linha central (esqueleto) da peça
+// ─── LED Calculation Engine v12 ────────────────────────────────────────────────
+// Motor A: GRID       — grade uniforme filtrada pela forma
+// Motor B: CENTERLINE — LEDs na linha central com PCA (suporta formas diagonais)
+//
+// REGRA v12: pitch = modW (largura do módulo LED)
+// PCA detecta o eixo principal real da peça (funciona em formas diagonais/curvas)
 
 export type LedEngine = "grid" | "centerline";
-
-const DEFAULT_THICKNESS_MM = 50; // espessura padrão quando não informada
 
 function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
-// Nova regra v11: pitch = espessura da peça (dimensão menor) / 3
-// Calibrado com projetos reais: letra com espessura ~99mm → pitch ~33mm ≈ 1 módulo 33x11
-function calcPitchFromThickness(thickness: number): number {
-  return Math.max(5, thickness / 3);
+// ── PCA: ângulo do eixo principal do polígono ─────────────────────────────────
+function pcaAngle(polygon: Point[]): number {
+  const n = polygon.length;
+  let cx = 0, cy = 0;
+  for (const p of polygon) { cx += p.x; cy += p.y; }
+  cx /= n; cy /= n;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (const p of polygon) {
+    const dx = p.x - cx, dy = p.y - cy;
+    sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+  }
+  // Ângulo do eigenvector principal da matriz de covariância 2×2
+  return 0.5 * Math.atan2(2 * sxy, sxx - syy);
+}
+
+// ── Rotação de ponto ──────────────────────────────────────────────────────────
+function rotatePt(p: Point, cos: number, sin: number): Point {
+  return { x: p.x * cos + p.y * sin, y: -p.x * sin + p.y * cos };
 }
 
 // ── GRID ENGINE ───────────────────────────────────────────────────────────────
@@ -132,14 +147,14 @@ function calcLedsGrid(
   const innerH = maxY - minY;
   if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
+  // v12: pitch = modW (dimensão maior do módulo), ou letterHeight×0.85
+  const ledW = rotation === 90 ? ledModel.height : ledModel.width;
+  const ledH = rotation === 90 ? ledModel.width : ledModel.height;
   let pitchBase: number;
   if (letterHeight && letterHeight > 0) {
     pitchBase = calcPitchFromLetterHeight(letterHeight);
   } else {
-    // Regra v11: pitch = espessura (dimensão menor) / 3
-    const thickness = Math.min(innerW, innerH);
-    const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-    pitchBase = calcPitchFromThickness(effectiveThickness);
+    pitchBase = Math.max(ledW, ledH); // 1 módulo por posição
   }
   if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
@@ -164,10 +179,13 @@ function calcLedsGrid(
   return { totalLeds: positions.length, pitch: pitchBase, pitchX, pitchY, positions };
 }
 
-// ── CENTERLINE ENGINE ─────────────────────────────────────────────────────────
-// Princípio: para cada scanline perpendicular à direção principal, encontra os
-// dois bordas do polígono e coloca o LED no ponto médio (linha central).
-// Assim os LEDs seguem o esqueleto da forma, como na Figura 2.
+// ── CENTERLINE ENGINE v12 — PCA + pitch = modW ────────────────────────────────
+// 1. PCA detecta o ângulo real do eixo principal da peça
+// 2. Rotaciona o polígono para alinhar ao eixo X
+// 3. Varre com pitch = modW (1 LED por módulo ao longo do comprimento)
+// 4. LED posicionado no centro da espessura (linha central)
+// 5. Rotaciona as posições de volta para o espaço original
+// Funciona corretamente em letras horizontais, verticais, diagonais e curvas
 function calcLedsCenterline(
   polygon: Point[],
   holes: Point[][],
@@ -176,48 +194,47 @@ function calcLedsCenterline(
 ): { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> } {
   if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
+  // 1. PCA: ângulo do eixo principal
+  let angle = pcaAngle(polygon);
+  let cos = Math.cos(-angle), sin = Math.sin(-angle);
+  let rotPoly = polygon.map(p => rotatePt(p, cos, sin));
+
+  // 2. Bbox no espaço rotacionado
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of polygon) {
+  for (const p of rotPoly) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
     if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
-  const W = maxX - minX;
-  const H = maxY - minY;
+  let W = maxX - minX, H = maxY - minY;
   if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // Detecta direção principal: mais longo eixo
-  const alongX = W >= H; // varre ao longo de X se o objeto é mais horizontal
+  // 3. Garante W = eixo LONGO (flip +90° se necessário)
+  if (H > W) {
+    angle += Math.PI / 2;
+    cos = Math.cos(-angle); sin = Math.sin(-angle);
+    rotPoly = polygon.map(p => rotatePt(p, cos, sin));
+    minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+    for (const p of rotPoly) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    W = maxX - minX; H = maxY - minY;
+  }
 
-  // Espessura = dimensão perpendicular ao comprimento principal
-  const thickness = alongX ? H : W;
-  const estimatedThickness = letterHeight && letterHeight > 0
-    ? letterHeight
-    : thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
+  // Buracos também rotacionados
+  const cosBack = Math.cos(angle), sinBack = Math.sin(angle);
+  const rotHoles = holes.map(h => h.map(p => rotatePt(p, cos, sin)));
 
-  // Pitch ao longo do comprimento principal
-  // Regra v11: pitch = espessura / 3 (calibrado com projetos reais)
+  // 4. Pitch = modW (1 módulo por posição ao longo do comprimento)
   let pitch: number;
   if (letterHeight && letterHeight > 0) {
     pitch = calcPitchFromLetterHeight(letterHeight);
   } else {
-    pitch = calcPitchFromThickness(estimatedThickness);
+    pitch = Math.max(ledModel.width, ledModel.height); // dimensão maior do módulo
   }
-  if (pitch <= 0) pitch = DEFAULT_THICKNESS_MM / 3;
+  if (pitch <= 0) pitch = 33;
 
-  // Função auxiliar: interseções de scanline horizontal (y=ty) com o polígono
-  function scanlineX(ty: number, poly: Point[]): number[] {
-    const xs: number[] = [];
-    for (let i = 0, n = poly.length; i < n; i++) {
-      const a = poly[i], b = poly[(i + 1) % n];
-      if ((a.y <= ty && b.y > ty) || (b.y <= ty && a.y > ty)) {
-        const t = (ty - a.y) / (b.y - a.y);
-        xs.push(a.x + t * (b.x - a.x));
-      }
-    }
-    return xs.sort((a, b) => a - b);
-  }
-
-  // Função auxiliar: interseções de scanline vertical (x=tx) com o polígono
+  // 5. Scanline vertical (x=tx) no espaço rotacionado
   function scanlineY(tx: number, poly: Point[]): number[] {
     const ys: number[] = [];
     for (let i = 0, n = poly.length; i < n; i++) {
@@ -230,49 +247,27 @@ function calcLedsCenterline(
     return ys.sort((a, b) => a - b);
   }
 
-  const positions: Array<{ x: number; y: number }> = [];
+  const steps = Math.max(1, Math.round(W / pitch));
+  const actualPitch = W / steps;
+  const rotPositions: Array<{ x: number; y: number }> = [];
 
-  if (alongX) {
-    // Varre X com passo = pitch; para cada X, encontra a linha central em Y
-    const steps = Math.max(1, Math.round(W / pitch));
-    const actualPitch = W / steps;
-    for (let i = 0; i < steps; i++) {
-      const tx = minX + (i + 0.5) * actualPitch;
-      const ys = scanlineY(tx, polygon);
-      if (ys.length < 2) continue;
-      // Para cada par de bordas: ponto médio = linha central
-      for (let j = 0; j + 1 < ys.length; j += 2) {
-        const yMid = (ys[j] + ys[j + 1]) / 2;
-        const pt = { x: tx, y: yMid };
-        // Verifica que não está em buraco
-        let inHole = false;
-        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
-        if (!inHole) positions.push(pt);
-      }
+  for (let i = 0; i < steps; i++) {
+    const tx = minX + (i + 0.5) * actualPitch;
+    const ys = scanlineY(tx, rotPoly);
+    if (ys.length < 2) continue;
+    for (let j = 0; j + 1 < ys.length; j += 2) {
+      const yMid = (ys[j] + ys[j + 1]) / 2;
+      const rpt = { x: tx, y: yMid };
+      let inHole = false;
+      for (const rh of rotHoles) { if (pointInPoly(rpt, rh)) { inHole = true; break; } }
+      if (!inHole) rotPositions.push(rpt);
     }
-    const pitchX = steps > 0 ? W / steps : pitch;
-    const pitchY = pitch;
-    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
-  } else {
-    // Varre Y com passo = pitch; para cada Y, linha central em X
-    const steps = Math.max(1, Math.round(H / pitch));
-    const actualPitch = H / steps;
-    for (let i = 0; i < steps; i++) {
-      const ty = minY + (i + 0.5) * actualPitch;
-      const xs = scanlineX(ty, polygon);
-      if (xs.length < 2) continue;
-      for (let j = 0; j + 1 < xs.length; j += 2) {
-        const xMid = (xs[j] + xs[j + 1]) / 2;
-        const pt = { x: xMid, y: ty };
-        let inHole = false;
-        for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
-        if (!inHole) positions.push(pt);
-      }
-    }
-    const pitchX = pitch;
-    const pitchY = steps > 0 ? H / steps : pitch;
-    return { totalLeds: positions.length, pitch, pitchX, pitchY, positions };
   }
+
+  // 6. Rotaciona posições de volta para o espaço original
+  const positions = rotPositions.map(p => rotatePt(p, cosBack, sinBack));
+
+  return { totalLeds: positions.length, pitch: actualPitch, pitchX: actualPitch, pitchY: H, positions };
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -319,7 +314,7 @@ function calcLedsForPart(
   return { ...best, bestRotation };
 }
 
-// Aproximação bbox (para sumário e tabela)
+// Aproximação bbox (para sumário e tabela) — v12: pitch = modW
 function calcLedsForBbox(
   partWidth: number,
   partHeight: number,
@@ -331,29 +326,28 @@ function calcLedsForBbox(
   const W = partWidth;
   const H = partHeight;
   if (W <= 0 || H <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
+  void borderMargin; void ledRotation;
 
-  const calcForRotation = (rot: 0 | 90) => {
-    let pitchBase: number;
-    if (letterHeight && letterHeight > 0) {
-      pitchBase = calcPitchFromLetterHeight(letterHeight);
-    } else {
-      // Regra v11: pitch = espessura (dimensão menor) / 3
-      const thickness = Math.min(W, H);
-      const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-      pitchBase = calcPitchFromThickness(effectiveThickness);
-    }
-    void rot; // rotation hint kept for signature compat
-    if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
-    const ledsX = Math.max(1, Math.floor(W / pitchBase));
-    const ledsY = Math.max(1, Math.floor(H / pitchBase));
-    const pitchX = W / ledsX;
-    const pitchY = H / ledsY;
-    return { ledsX, ledsY, totalLeds: ledsX * ledsY, pitch: pitchBase, pitchX, pitchY };
-  };
+  // v12: pitch = modW (dimensão maior do módulo), ou letterHeight×0.85
+  let pitchBase: number;
+  if (letterHeight && letterHeight > 0) {
+    pitchBase = calcPitchFromLetterHeight(letterHeight);
+  } else {
+    pitchBase = Math.max(ledModel.width, ledModel.height);
+  }
+  if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
 
-  const r0 = calcForRotation(0);
-  const r90 = calcForRotation(90);
-  return r90.totalLeds > r0.totalLeds ? r90 : r0;
+  // Ao longo do eixo longo (como o centerline faz)
+  const alongX = W >= H;
+  const mainDim = alongX ? W : H;
+  const crossDim = alongX ? H : W;
+  const ledsMain = Math.max(1, Math.round(mainDim / pitchBase));
+  const pitchMain = mainDim / ledsMain;
+  const ledsX = alongX ? ledsMain : 1;
+  const ledsY = alongX ? 1 : ledsMain;
+  const pitchX = alongX ? pitchMain : crossDim;
+  const pitchY = alongX ? crossDim : pitchMain;
+  return { ledsX, ledsY, totalLeds: ledsMain, pitch: pitchMain, pitchX, pitchY };
 }
 
 // ─── Canvas rendering ─────────────────────────────────────────────────────
@@ -1309,7 +1303,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 11</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 12</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1575,8 +1569,8 @@ export default function NestingApp() {
                   </div>
                   <p className="text-[9px] text-muted-foreground/60 italic">
                     {ledEngine === "centerline"
-                      ? "LEDs no centro da espessura, ao longo do comprimento · pitch = espessura ÷ 3"
-                      : "Grade uniforme com filtro pela forma real do polígono · pitch = espessura ÷ 3"}
+                      ? "PCA detecta eixo principal real · pitch = modW · suporta diagonal"
+                      : "Grade uniforme filtrada pela forma real · pitch = modW"}
                   </p>
                 </div>
 
@@ -1601,7 +1595,7 @@ export default function NestingApp() {
                     )}
                   </div>
                   <p className="text-[9px] text-yellow-400/70">
-                    Com altura da letra: pitch = altura × 0,85 · Sem altura: pitch = espessura da peça ÷ 3 (v11)
+                    Com altura: pitch = altura × 0,85 · Sem altura: pitch = largura do módulo (modW)
                   </p>
                 </div>
 
