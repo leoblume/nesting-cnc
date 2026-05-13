@@ -107,6 +107,12 @@ function calcPitchFromLetterHeight(letterHeight: number): number {
   return letterHeight * 0.85;
 }
 
+// Nova regra v11: pitch = espessura da peça (dimensão menor) / 3
+// Calibrado com projetos reais: letra com espessura ~99mm → pitch ~33mm ≈ 1 módulo 33x11
+function calcPitchFromThickness(thickness: number): number {
+  return Math.max(5, thickness / 3);
+}
+
 // ── GRID ENGINE ───────────────────────────────────────────────────────────────
 function calcLedsGrid(
   polygon: Point[],
@@ -130,12 +136,10 @@ function calcLedsGrid(
   if (letterHeight && letterHeight > 0) {
     pitchBase = calcPitchFromLetterHeight(letterHeight);
   } else {
-    const ledW = rotation === 90 ? ledModel.height : ledModel.width;
-    const ledH = rotation === 90 ? ledModel.width : ledModel.height;
-    const ledRef = Math.max(ledW, ledH);
+    // Regra v11: pitch = espessura (dimensão menor) / 3
     const thickness = Math.min(innerW, innerH);
     const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-    pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
+    pitchBase = calcPitchFromThickness(effectiveThickness);
   }
   if (pitchBase <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
@@ -181,23 +185,24 @@ function calcLedsCenterline(
   const H = maxY - minY;
   if (W <= 0 || H <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // Determina espessura média do objeto (dimensão menor do bbox)
+  // Detecta direção principal: mais longo eixo
+  const alongX = W >= H; // varre ao longo de X se o objeto é mais horizontal
+
+  // Espessura = dimensão perpendicular ao comprimento principal
+  const thickness = alongX ? H : W;
   const estimatedThickness = letterHeight && letterHeight > 0
     ? letterHeight
-    : Math.min(W, H) > 0 ? Math.min(W, H) : DEFAULT_THICKNESS_MM;
+    : thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
 
   // Pitch ao longo do comprimento principal
+  // Regra v11: pitch = espessura / 3 (calibrado com projetos reais)
   let pitch: number;
   if (letterHeight && letterHeight > 0) {
     pitch = calcPitchFromLetterHeight(letterHeight);
   } else {
-    const ledRef = Math.max(ledModel.width, ledModel.height);
-    pitch = Math.min(ledRef, estimatedThickness * 0.9);
-    if (pitch <= 0) pitch = ledRef > 0 ? ledRef : DEFAULT_THICKNESS_MM * 0.7;
+    pitch = calcPitchFromThickness(estimatedThickness);
   }
-
-  // Detecta direção principal: mais longo eixo
-  const alongX = W >= H; // varre ao longo de X se o objeto é mais horizontal
+  if (pitch <= 0) pitch = DEFAULT_THICKNESS_MM / 3;
 
   // Função auxiliar: interseções de scanline horizontal (y=ty) com o polígono
   function scanlineX(ty: number, poly: Point[]): number[] {
@@ -332,13 +337,12 @@ function calcLedsForBbox(
     if (letterHeight && letterHeight > 0) {
       pitchBase = calcPitchFromLetterHeight(letterHeight);
     } else {
-      const ledW = rot === 90 ? ledModel.height : ledModel.width;
-      const ledH = rot === 90 ? ledModel.width : ledModel.height;
-      const ledRef = Math.max(ledW, ledH);
+      // Regra v11: pitch = espessura (dimensão menor) / 3
       const thickness = Math.min(W, H);
       const effectiveThickness = thickness > 0 ? thickness : DEFAULT_THICKNESS_MM;
-      pitchBase = Math.min(ledRef, effectiveThickness * 0.9);
+      pitchBase = calcPitchFromThickness(effectiveThickness);
     }
+    void rot; // rotation hint kept for signature compat
     if (pitchBase <= 0) return { ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0 };
     const ledsX = Math.max(1, Math.floor(W / pitchBase));
     const ledsY = Math.max(1, Math.floor(H / pitchBase));
@@ -945,7 +949,7 @@ function printPlan(
 
       const S = Math.min(3, 300 / Math.max(g.width, g.height));
       const cw = Math.round(g.width * S + 48);
-      const ch = Math.round(g.height * S + 80);
+      const ch = Math.round(g.height * S + 120); // v11: aumentado para não cortar labels abaixo da peça
       const canvas = document.createElement("canvas");
       canvas.width = cw; canvas.height = ch;
       const ctx = canvas.getContext("2d")!;
@@ -1111,7 +1115,7 @@ export default function NestingApp() {
   const [activeSheet, setActiveSheet] = useState(0);
   const [parseError, setParseError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"nesting" | "leds" | "ledcad">("nesting");
-  const [opts, setOpts] = useState<NestingOptions>({ sheetWidth: 2750, sheetHeight: 1830, gap: 5, margin: 10, allowRotation: true, allowMirror: false, priority: "yield" });
+  const [opts, setOpts] = useState<NestingOptions>({ sheetWidth: 1210, sheetHeight: 2420, gap: 5, margin: 10, allowRotation: true, allowMirror: false, priority: "yield" });
 
   // LED state — persisted in localStorage
   const [ledModels, setLedModels] = useState<LedModel[]>(() => {
@@ -1166,12 +1170,13 @@ export default function NestingApp() {
     setRenderedLedId(selectedLedId);
   }, [selectedLedId]);
 
+  // Auto-recalculate when LED model, module selection, letter height, or engine changes
   useEffect(() => {
-    if (selectedLedId && renderedLedId === null) {
+    if (selectedLedId) {
       setRenderedLedId(selectedLedId);
       setLedKey((k) => k + 1);
     }
-  }, [selectedLedId]);
+  }, [selectedLedId, letterHeight, ledEngine, ledAssignments]);
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
@@ -1304,7 +1309,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 10</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 11</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -1570,8 +1575,8 @@ export default function NestingApp() {
                   </div>
                   <p className="text-[9px] text-muted-foreground/60 italic">
                     {ledEngine === "centerline"
-                      ? "LEDs no centro da espessura da peça, ao longo do comprimento"
-                      : "Grade uniforme com filtro pela forma real do polígono"}
+                      ? "LEDs no centro da espessura, ao longo do comprimento · pitch = espessura ÷ 3"
+                      : "Grade uniforme com filtro pela forma real do polígono · pitch = espessura ÷ 3"}
                   </p>
                 </div>
 
@@ -1596,7 +1601,7 @@ export default function NestingApp() {
                     )}
                   </div>
                   <p className="text-[9px] text-yellow-400/70">
-                    Pitch = altura × 0,85 · Se vazio: usa espessura padrão {DEFAULT_THICKNESS_MM} mm
+                    Com altura da letra: pitch = altura × 0,85 · Sem altura: pitch = espessura da peça ÷ 3 (v11)
                   </p>
                 </div>
 
