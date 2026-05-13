@@ -109,8 +109,18 @@ export interface AiTrainingExample {
   uploadedAt: number;
 }
 
-function calcPitchFromLetterHeight(letterHeight: number): number {
-  return letterHeight * 0.85;
+function calcPitchFromLetterHeight(
+  letterHeight: number,
+  ledW: number,
+  ledH: number,
+): { pitchX: number; pitchY: number } {
+  // área útil interna = espessura da letra - 30%
+  const usable = Math.max(1, letterHeight * 0.7);
+
+  return {
+    pitchX: Math.max(ledW, usable),
+    pitchY: Math.max(ledH, usable),
+  };
 }
 
 // ── GRID ENGINE v12.1 — corrigido: espaçamento real por tamanho do módulo ──────
@@ -145,36 +155,58 @@ function calcLedsGrid(
   let pitchY: number;
 
   if (letterHeight && letterHeight > 0) {
-    // Quando usa altura de letra: pitch igual em X e Y
-    const p = calcPitchFromLetterHeight(letterHeight);
-    pitchX = p;
-    pitchY = p;
+    // Regra: espessura útil da letra = Z - 30%
+    const adaptive = calcPitchFromLetterHeight(letterHeight, ledW, ledH);
+    pitchX = adaptive.pitchX;
+    pitchY = adaptive.pitchY;
   } else {
     // Pitch real = dimensão do módulo LED
     pitchX = ledW > 0 ? ledW : 1;
     pitchY = ledH > 0 ? ledH : 1;
   }
 
-  // Número de posições que cabem
-  const cols = Math.max(1, Math.floor(innerW / pitchX));
-  const rows = Math.max(1, Math.floor(innerH / pitchY));
+  // margem dinâmica baseada no pitch atual
+  const insetMargin = Math.min(pitchX, pitchY) * 0.35;
 
-  // Centralizar o grid dentro do bbox da peça
-  const offsetX = (innerW - cols * pitchX) / 2;
-  const offsetY = (innerH - rows * pitchY) / 2;
+  // cria um polígono interno para evitar LEDs colados na borda
+  const workPoly = shrinkPolygon(polygon, insetMargin);
 
   const positions: Array<{ x: number; y: number }> = [];
 
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      const x = minX + offsetX + col * pitchX + pitchX / 2;
-      const y = minY + offsetY + row * pitchY + pitchY / 2;
+  // bbox do polígono interno
+  let wMinX = Infinity, wMinY = Infinity;
+  let wMaxX = -Infinity, wMaxY = -Infinity;
+
+  for (const p of workPoly) {
+    if (p.x < wMinX) wMinX = p.x;
+    if (p.x > wMaxX) wMaxX = p.x;
+    if (p.y < wMinY) wMinY = p.y;
+    if (p.y > wMaxY) wMaxY = p.y;
+  }
+
+  // distribuição adaptativa acompanhando o vetor
+  for (let y = wMinY + pitchY / 2; y <= wMaxY; y += pitchY) {
+    const rowOffset = Math.floor((y - wMinY) / pitchY) % 2 === 0
+      ? 0
+      : pitchX / 2;
+
+    for (let x = wMinX + pitchX / 2 + rowOffset; x <= wMaxX; x += pitchX) {
       const pt = { x, y };
-      if (!pointInPoly(pt, polygon)) continue;
+
+      if (!pointInPoly(pt, workPoly)) continue;
+
       let inHole = false;
-      for (const hole of holes) { if (pointInPoly(pt, hole)) { inHole = true; break; } }
+
+      for (const hole of holes) {
+        if (pointInPoly(pt, hole)) {
+          inHole = true;
+          break;
+        }
+      }
+
       if (inHole) continue;
-      positions.push({ x, y });
+
+      positions.push(pt);
     }
   }
 
@@ -199,9 +231,9 @@ function calcLedsGrid(
 // Cache de resultados por hash do polígono + ledModel + letterHeight
 const aiLedCache = new Map<string, { totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }>();
 
-function polyHash(polygon: Point[], ledModel: LedModel, letterHeight: number | null): string {
+function polyHash(polygon: Point[], ledModel: LedModel, letterHeight: number | null, rotation: 0 | 90 = 0): string {
   const pts = polygon.slice(0, 8).map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join("|");
-  return `${pts}_${ledModel.width}x${ledModel.height}_lh${letterHeight}`;
+  return `${pts}_${ledModel.width}x${ledModel.height}_lh${letterHeight}_rot${rotation}`;
 }
 
 async function calcLedsAI(
@@ -211,7 +243,7 @@ async function calcLedsAI(
   letterHeight: number | null,
   trainingExamples: AiTrainingExample[],
 ): Promise<{ totalLeds: number; pitch: number; pitchX: number; pitchY: number; positions: Array<{ x: number; y: number }> }> {
-  const hash = polyHash(polygon, ledModel, letterHeight);
+  const hash = polyHash(polygon, ledModel, letterHeight, 0);
   if (aiLedCache.has(hash)) return aiLedCache.get(hash)!;
 
   if (polygon.length < 3) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
@@ -365,8 +397,9 @@ function calcLedsForBbox(
 
   let pitchX: number, pitchY: number;
   if (letterHeight && letterHeight > 0) {
-    pitchX = calcPitchFromLetterHeight(letterHeight);
-    pitchY = pitchX;
+    const adaptive = calcPitchFromLetterHeight(letterHeight, ledModel.width, ledModel.height);
+    pitchX = adaptive.pitchX;
+    pitchY = adaptive.pitchY;
   } else {
     pitchX = ledModel.width > 0 ? ledModel.width : 1;
     pitchY = ledModel.height > 0 ? ledModel.height : 1;
@@ -1256,7 +1289,7 @@ export default function NestingApp() {
       setRenderedLedId(selectedLedId);
       setLedKey((k) => k + 1);
     }
-  }, [selectedLedId, letterHeight, ledEngine, ledAssignments]);
+  }, [selectedLedId, letterHeight, ledEngine, ledAssignments, JSON.stringify(ledModels)]);
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
