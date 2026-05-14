@@ -1534,15 +1534,14 @@ export default function NestingApp() {
   const selectedLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
   const ledNeedsUpdate = selectedLedId !== renderedLedId;
 
-  // Assign a specific LED to a group — clears AI cache for that group so recalculation happens
+  // Assign a specific LED to a group — triggers ledSummary recompute via ledAssignmentsKey
   const assignLedToGroup = useCallback((groupKey: string, ledId: string) => {
-    aiLedCache.clear(); // force full recalc for AI engine
+    aiLedCache.clear();
     setLedAssignments((prev) => ({ ...prev, [groupKey]: ledId }));
-    setRenderedLedId(ledId); // ensure canvas resolves immediately
     setLedKey((k) => k + 1);
   }, []);
 
-  // Clear assignment (revert to global)
+  // Clear per-group assignment (revert to global LED)
   const clearGroupAssignment = useCallback((groupKey: string) => {
     aiLedCache.clear();
     setLedAssignments((prev) => {
@@ -1558,16 +1557,15 @@ export default function NestingApp() {
     setRenderedLedId(selectedLedId);
   }, [selectedLedId]);
 
-  // Auto-recalculate when LED model, module selection, letter height, engine, or per-group assignment changes
+  // Auto-recalculate when global LED selection, letter height, or engine changes
+  // NOTE: per-group assignment changes are handled directly in assignLedToGroup/clearGroupAssignment
+  //       to avoid stale-closure race between useEffect and the new ledAssignments state
   const ledModelsKey = JSON.stringify(ledModels.map(l => `${l.id}:${l.width}x${l.height}`));
-  const ledAssignmentsKey = JSON.stringify(ledAssignments);
   useEffect(() => {
-    // always bump key when anything LED-related changes — covers per-group swap
     setRenderedLedId(selectedLedId);
     setLedKey((k) => k + 1);
-    // clear AI cache so re-assignment triggers fresh AI calculation
     aiLedCache.clear();
-  }, [selectedLedId, letterHeight, ledEngine, ledAssignmentsKey, ledModelsKey]);
+  }, [selectedLedId, letterHeight, ledEngine, ledModelsKey]);
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
@@ -1646,6 +1644,9 @@ export default function NestingApp() {
   }, [result, parts, groups, opts.sheetWidth, opts.sheetHeight, opts.margin]);
 
   // LED summary using shape-aware calc, respecting per-group assignments
+  // Stable string key for ledAssignments — used as useMemo dependency to guarantee reactivity
+  const ledAssignmentsKey = JSON.stringify(ledAssignments);
+
   const ledSummary = useMemo(() => {
     if (!groups.length || !ledModels.length) return null;
     const hasAnyLed = groups.some((g) => {
@@ -1659,24 +1660,38 @@ export default function NestingApp() {
       const ledModel = ledModels.find((l) => l.id === assignedId) ?? null;
       if (!ledModel) return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: 0, ledsX: 0, ledsY: 0, totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, totalPower: 0, ledName: "–" };
 
-      const poly = g.parts[0]?.outer ?? [];
+      const poly  = g.parts[0]?.outer ?? [];
       const holes = g.parts[0]?.holes ?? [];
-      let totalLeds = 0, pitch = 0, pitchX = 0, pitchY = 0;
+
+      // Always use the same engine/path as the canvas so quantities match exactly
+      let ledsPerPiece = 0, pitch = 0, pitchX = 0, pitchY = 0;
       if (poly.length) {
-        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
-        totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
+        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, 0, ledEngine);
+        ledsPerPiece = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       } else {
-        const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
-        totalLeds = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
+        const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, 0);
+        ledsPerPiece = r.totalLeds; pitch = r.pitch; pitchX = r.pitchX; pitchY = r.pitchY;
       }
-      const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
-      const totalPower = totalLeds * ledModel.power * g.quantity;
-      return { width: g.width, height: g.height, qty: g.quantity, ledsPerPiece: totalLeds, ledsX, ledsY, totalLeds: totalLeds * g.quantity, pitch, pitchX, pitchY, totalPower, ledName: ledModel.name };
+
+      const totalPower = ledsPerPiece * ledModel.power * g.quantity;
+      return {
+        width: g.width, height: g.height,
+        qty: g.quantity,
+        ledsPerPiece,
+        ledsX: 0, ledsY: 0,   // not used in display, kept for compat
+        totalLeds: ledsPerPiece * g.quantity,
+        pitch, pitchX, pitchY,
+        totalPower,
+        ledName: ledModel.name,
+      };
     });
-    const totalLeds = rows.reduce((s, r) => s + r.totalLeds, 0);
+
+    const totalLeds  = rows.reduce((s, r) => s + r.totalLeds,  0);
     const totalPower = rows.reduce((s, r) => s + r.totalPower, 0);
     return { rows, totalLeds, totalPower };
-  }, [groups, ledModels, selectedLedId, ledAssignments, letterHeight, ledKey, ledEngine]);
+    // ledAssignmentsKey (not ledAssignments) forces recompute on every assignment change
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, ledModels, selectedLedId, ledAssignmentsKey, letterHeight, ledKey, ledEngine]);
 
   const colorLegend = useMemo(() => {
     if (!result) return [];
