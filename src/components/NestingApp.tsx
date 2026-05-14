@@ -114,18 +114,31 @@ function calcPitchFromLetterHeight(
   ledW?: number,
   ledH?: number,
 ): number | { pitchX: number; pitchY: number } {
-  // regra: espessura útil = 70%
-  const usable = letterHeight * 0.7;
+  const adaptiveBase = Math.max(letterHeight * 0.18, 8);
 
-  // compatibilidade antiga — sem ledW/ledH retorna escalar
   if (ledW == null || ledH == null) {
-    return usable;
+    return adaptiveBase;
   }
 
-  return {
-    pitchX: Math.max(ledW, usable),
-    pitchY: Math.max(ledH, usable),
-  };
+  let pitchX = Math.max(ledW * 1.35, adaptiveBase);
+  let pitchY = Math.max(ledH * 1.35, adaptiveBase);
+
+  const minDim = Math.min(letterHeight, Math.max(ledW, ledH) * 10);
+
+  if (minDim < ledW * 8) {
+    pitchX *= 0.72;
+    pitchY *= 0.72;
+  }
+
+  if (minDim < ledW * 5) {
+    pitchX *= 0.55;
+    pitchY *= 0.55;
+  }
+
+  pitchX = Math.max(ledW * 0.9, pitchX);
+  pitchY = Math.max(ledH * 0.9, pitchY);
+
+  return { pitchX, pitchY };
 }
 
 // ── GRID ENGINE v12.1 — corrigido: espaçamento real por tamanho do módulo ──────
@@ -176,7 +189,7 @@ function calcLedsGrid(
 
   // (colmeia usa bbox direto de workPoly, não precisa de cols/rows fixos)
   // margem dinâmica — afasta LEDs da borda
-  const insetMargin = Math.min(pitchX, pitchY) * 0.35;
+  const insetMargin = Math.min(Math.min(pitchX, pitchY) * 0.18, Math.min(innerW, innerH) * 0.12);
 
   // polígono interno (offset para dentro)
   const workPoly = shrinkPolygon(polygon, insetMargin);
@@ -194,10 +207,11 @@ function calcLedsGrid(
 
   // distribuição adaptativa tipo colmeia (offset em linhas alternadas)
   for (let y = wMinY + pitchY / 2; y <= wMaxY; y += pitchY) {
+    const compactShape = innerW < pitchX * 3;
     const rowOffset =
       Math.floor((y - wMinY) / pitchY) % 2 === 0
         ? 0
-        : pitchX / 2;
+        : compactShape ? 0 : pitchX / 2;
 
     for (let x = wMinX + pitchX / 2 + rowOffset; x <= wMaxX; x += pitchX) {
       const pt = { x, y };
@@ -913,7 +927,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs · ${pitchX.toFixed(0)} x ${pitchY.toFixed(0)} mm`, ox + pw / 2, oy + ph + 8);
 
           ctx.fillStyle = engine === "ai" ? "#7c3aed" : "#a855f7";
           ctx.font = "8px monospace";
@@ -927,7 +941,7 @@ function LedDrawingCanvas({
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 32);
+          
         } else {
           ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
@@ -971,7 +985,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · ↔${pitchX.toFixed(1)} ↕${pitchY.toFixed(1)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs · ${pitchX.toFixed(0)} x ${pitchY.toFixed(0)} mm`, ox + pw / 2, oy + ph + 8);
         }
       }
     });
