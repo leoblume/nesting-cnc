@@ -95,7 +95,7 @@ function shrinkPolygon(poly: Point[], margin: number): Point[] {
   return result;
 }
 
-// ─── LED Calculation Engine v12.1 ──────────────────────────────────────────────
+// ─── LED Calculation Engine v14 ──────────────────────────────────────────────
 // Motor A: GRID     — grade uniforme, pitch = tamanho do LED, mínimo 1 LED por objeto
 // Motor B: AI       — usa Claude API aprendendo com exemplos de PDFs
 
@@ -159,6 +159,13 @@ function calcPitchFromLetterHeight(
     pitchY *= 0.74;
   }
 
+  // curvas e formatos arredondados:
+  // melhora encaixe sem explodir quantidade
+  if (letterHeight < 160) {
+    pitchX *= 0.93;
+    pitchY *= 0.93;
+  }
+
   // limites mínimos
   pitchX = Math.max(pitchX, ledW * 1.45);
   pitchY = Math.max(pitchY, ledH * 1.45);
@@ -169,7 +176,7 @@ function calcPitchFromLetterHeight(
   };
 }
 
-// ── GRID ENGINE v12.1 — corrigido: espaçamento real por tamanho do módulo ──────
+// ── GRID ENGINE v14 — corrigido: espaçamento real por tamanho do módulo ──────
 // Regras:
 //  1. pitchX = ledW, pitchY = ledH (espaço real do módulo)
 //  2. Grid começa no centro da primeira célula a partir do bbox da peça
@@ -193,7 +200,7 @@ function calcLedsGrid(
   const innerH = maxY - minY;
   if (innerW <= 0 || innerH <= 0) return { totalLeds: 0, pitch: 0, pitchX: 0, pitchY: 0, positions: [] };
 
-  // v12.1: pitchX = largura do LED, pitchY = altura do LED (espaçamento real)
+  // v14: pitchX = largura do LED, pitchY = altura do LED (espaçamento real)
   const ledW = rotation === 90 ? ledModel.height : ledModel.width;
   const ledH = rotation === 90 ? ledModel.width : ledModel.height;
 
@@ -237,7 +244,7 @@ function calcLedsGrid(
   }
 
   // distribuição adaptativa tipo colmeia (offset em linhas alternadas)
-  for (let y = wMinY + pitchY / 2; y <= wMaxY; y += pitchY) {
+  for (let y = wMinY + (innerH < 120 ? pitchY * 0.35 : pitchY / 2); y <= wMaxY; y += pitchY) {
     const rowOffset =
       innerW < pitchX * 3
         ? 0
@@ -437,7 +444,7 @@ function calcLedsForPart(
   return { ...best, bestRotation };
 }
 
-// Aproximação bbox (para sumário e tabela) — v12.1: pitch = tamanho do LED
+// Aproximação bbox (para sumário e tabela) — v14: pitch = tamanho do LED
 function calcLedsForBbox(
   partWidth: number,
   partHeight: number,
@@ -1408,7 +1415,7 @@ tfoot td:first-child { text-align: left; }
   </div>
   <div class="doc-meta">
     Gerado: ${now}<br>
-    NestCNC v12.1
+    NestCNC v14
   </div>
 </div>
 
@@ -1769,7 +1776,7 @@ export default function NestingApp() {
         <div>
           <h1 className="text-base font-semibold tracking-tight">NestCNC</h1>
           <p className="text-xs text-muted-foreground">Aproveitamento automático de chapas</p>
-          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 12.1</p>
+          <p className="text-[10px] text-muted-foreground/60 leading-none mt-0.5">vers 14</p>
         </div>
         <div className="ml-auto flex gap-1 rounded-lg border border-border p-1">
           <button onClick={() => setActiveTab("nesting")} className={`flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors ${activeTab === "nesting" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}>
@@ -2335,4 +2342,12 @@ export default function NestingApp() {
       </div>
     </div>
   );
+}
+
+
+// v14 print cleanup
+function applyPrintMinimalStyle(ctx: CanvasRenderingContext2D) {
+  ctx.shadowBlur = 0;
+  ctx.shadowColor = 'transparent';
+  ctx.filter = 'none';
 }
