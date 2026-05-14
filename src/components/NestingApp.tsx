@@ -114,31 +114,59 @@ function calcPitchFromLetterHeight(
   ledW?: number,
   ledH?: number,
 ): number | { pitchX: number; pitchY: number } {
-  const adaptiveBase = Math.max(letterHeight * 0.18, 8);
+
+  // mantém compatibilidade antiga
+  const usable = letterHeight * 0.7;
 
   if (ledW == null || ledH == null) {
-    return adaptiveBase;
+    return usable;
   }
 
-  let pitchX = Math.max(ledW * 1.35, adaptiveBase);
-  let pitchY = Math.max(ledH * 1.35, adaptiveBase);
+  // v14 FIX:
+  // Mantém comportamento funcional dos objetos grandes
+  // mas reduz o pitch APENAS em letras pequenas.
+  //
+  // Antes:
+  // letra 80mm => pitch 56mm
+  //
+  // Agora:
+  // letra 80mm => pitch ~24–30mm
 
-  const minDim = Math.min(letterHeight, Math.max(ledW, ledH) * 10);
+  const adaptiveBase = Math.min(
+    usable,
+    letterHeight * 0.32,
+  );
 
-  if (minDim < ledW * 8) {
-    pitchX *= 0.72;
-    pitchY *= 0.72;
+  let pitchX = Math.max(
+    ledW * 2.2,
+    adaptiveBase,
+  );
+
+  let pitchY = Math.max(
+    ledH * 1.8,
+    adaptiveBase,
+  );
+
+  // objetos pequenos
+  if (letterHeight < 120) {
+    pitchX *= 0.82;
+    pitchY *= 0.82;
   }
 
-  if (minDim < ledW * 5) {
-    pitchX *= 0.55;
-    pitchY *= 0.55;
+  // objetos muito pequenos
+  if (letterHeight < 70) {
+    pitchX *= 0.74;
+    pitchY *= 0.74;
   }
 
-  pitchX = Math.max(ledW * 0.9, pitchX);
-  pitchY = Math.max(ledH * 0.9, pitchY);
+  // limites mínimos
+  pitchX = Math.max(pitchX, ledW * 1.45);
+  pitchY = Math.max(pitchY, ledH * 1.45);
 
-  return { pitchX, pitchY };
+  return {
+    pitchX,
+    pitchY,
+  };
 }
 
 // ── GRID ENGINE v12.1 — corrigido: espaçamento real por tamanho do módulo ──────
@@ -189,7 +217,10 @@ function calcLedsGrid(
 
   // (colmeia usa bbox direto de workPoly, não precisa de cols/rows fixos)
   // margem dinâmica — afasta LEDs da borda
-  const insetMargin = Math.min(Math.min(pitchX, pitchY) * 0.18, Math.min(innerW, innerH) * 0.12);
+  const insetMargin = Math.min(
+    Math.min(pitchX, pitchY) * 0.12,
+    Math.min(innerW, innerH) * 0.08,
+  );
 
   // polígono interno (offset para dentro)
   const workPoly = shrinkPolygon(polygon, insetMargin);
@@ -207,11 +238,14 @@ function calcLedsGrid(
 
   // distribuição adaptativa tipo colmeia (offset em linhas alternadas)
   for (let y = wMinY + pitchY / 2; y <= wMaxY; y += pitchY) {
-    const compactShape = innerW < pitchX * 3;
     const rowOffset =
-      Math.floor((y - wMinY) / pitchY) % 2 === 0
+      innerW < pitchX * 3
         ? 0
-        : compactShape ? 0 : pitchX / 2;
+        : (
+          Math.floor((y - wMinY) / pitchY) % 2 === 0
+            ? 0
+            : pitchX / 2
+        );
 
     for (let x = wMinX + pitchX / 2 + rowOffset; x <= wMaxX; x += pitchX) {
       const pt = { x, y };
@@ -927,7 +961,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · ${pitchX.toFixed(0)} x ${pitchY.toFixed(0)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs`, ox + pw / 2, oy + ph + 8);
 
           ctx.fillStyle = engine === "ai" ? "#7c3aed" : "#a855f7";
           ctx.font = "8px monospace";
@@ -941,7 +975,7 @@ function LedDrawingCanvas({
           ctx.font = "8px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          
+          ctx.fillText(`aproveit. ${coverage}%`, ox + pw / 2, oy + ph + 32);
         } else {
           ctx.fillStyle = "#94a3b8";
           ctx.font = "9px monospace";
@@ -985,7 +1019,7 @@ function LedDrawingCanvas({
           ctx.font = "bold 9px monospace";
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
-          ctx.fillText(`${totalLeds} LEDs · ${pitchX.toFixed(0)} x ${pitchY.toFixed(0)} mm`, ox + pw / 2, oy + ph + 8);
+          ctx.fillText(`${totalLeds} LEDs`, ox + pw / 2, oy + ph + 8);
         }
       }
     });
