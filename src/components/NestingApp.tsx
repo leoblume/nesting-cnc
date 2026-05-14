@@ -1027,14 +1027,18 @@ function printPlan(
 
   const globalLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
 
-  // Build all sheet canvases as data-URLs
+  // ── Build sheet canvases ──────────────────────────────────────────────────
+  // A4 portrait at 96dpi ≈ 794×1123px; usable width ~740px
+  const SHEET_PX_W = 760;
+  const SHEET_PX_H = Math.round(SHEET_PX_W * (opts.sheetHeight / opts.sheetWidth));
+
   const sheetDataUrls: string[] = [];
   for (let si = 0; si < result.sheets.length; si++) {
     const canvas = document.createElement("canvas");
-    canvas.width = 900; canvas.height = 600;
-    // Hack: give it a fake parentElement
+    canvas.width  = SHEET_PX_W;
+    canvas.height = SHEET_PX_H;
     const wrapper = document.createElement("div");
-    wrapper.style.width = "900px"; wrapper.style.height = "600px";
+    wrapper.style.cssText = `width:${SHEET_PX_W}px;height:${SHEET_PX_H}px;position:absolute;left:-9999px`;
     wrapper.appendChild(canvas);
     document.body.appendChild(wrapper);
     renderSheet(canvas, result.sheets[si], opts.sheetWidth, opts.sheetHeight, opts.margin, globalLed, showLeds, 0, letterHeight, ledRotation);
@@ -1042,181 +1046,439 @@ function printPlan(
     document.body.removeChild(wrapper);
   }
 
-  // Build LED drawing canvases per group
-  const ledUrls: string[] = [];
-  if (groups.length) {
-    for (const g of groups) {
-      const ledModel = resolveLed(g.key);
-      const poly = g.parts[0]?.outer ?? [];
-      const holes = g.parts[0]?.holes ?? [];
+  // ── Build per-group LED thumbnail canvases ────────────────────────────────
+  // Cards rendered at 280×280 drawing zone — large enough to see LED dots clearly
+  const DRAW = 260;
+  const PAD  = 14;
+  const CANVAS_W = DRAW + PAD * 2;
+  const CANVAS_H = DRAW + PAD * 2;
 
-      let totalLeds = 0, pitch = 0;
-      if (ledModel) {
-        if (poly.length) {
-          const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
-          totalLeds = r.totalLeds; pitch = r.pitch;
-        } else {
-          const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
-          totalLeds = r.totalLeds; pitch = r.pitch;
-        }
+  interface LedCard {
+    dataUrl: string;
+    partLabel: string;      // "120 × 80 mm"
+    ledName: string;        // "LED SMD 5050"
+    ledDims: string;        // "5 × 5 mm"
+    ledsPerPiece: number;
+    totalLeds: number;      // ledsPerPiece × quantity
+    pitchX: number;
+    pitchY: number;
+    quantity: number;
+    power: number;          // W per piece
+  }
+
+  const ledCards: LedCard[] = [];
+
+  for (const g of groups) {
+    const ledModel = resolveLed(g.key);
+    const poly  = g.parts[0]?.outer ?? [];
+    const holes = g.parts[0]?.holes ?? [];
+
+    let ledsPerPiece = 0, pitchX = 0, pitchY = 0;
+    let positions: Array<{x:number;y:number}> = [];
+    let bestRotation: 0 | 90 = 0;
+
+    if (ledModel) {
+      if (poly.length) {
+        const r = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
+        ledsPerPiece = r.totalLeds; pitchX = r.pitchX; pitchY = r.pitchY;
+        positions = r.positions; bestRotation = r.bestRotation;
+      } else {
+        const r = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+        ledsPerPiece = r.totalLeds; pitchX = r.pitchX; pitchY = r.pitchY;
+      }
+    }
+
+    // Scale so the largest dimension fills the drawing zone
+    const S = Math.min(DRAW / Math.max(g.width, g.height, 1), 6);
+    const pw = g.width * S;
+    const ph = g.height * S;
+    const ox = PAD + (DRAW - pw) / 2;
+    const oy = PAD + (DRAW - ph) / 2;
+
+    const canvas = document.createElement("canvas");
+    canvas.width  = CANVAS_W;
+    canvas.height = CANVAS_H;
+    const ctx = canvas.getContext("2d")!;
+
+    // White background
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    if (poly.length > 0) {
+      let pminX = Infinity, pminY = Infinity;
+      for (const p of poly) {
+        if (p.x < pminX) pminX = p.x;
+        if (p.y < pminY) pminY = p.y;
+      }
+      const toS = (p: {x:number;y:number}) => ({ x: ox + (p.x - pminX) * S, y: oy + (p.y - pminY) * S });
+
+      // Part shape
+      ctx.beginPath();
+      const sp0 = toS(poly[0]); ctx.moveTo(sp0.x, sp0.y);
+      for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
+      ctx.closePath();
+      ctx.fillStyle = "#dbeafe"; ctx.fill();
+      ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5; ctx.stroke();
+
+      // Holes
+      for (const hole of holes) {
+        if (!hole.length) continue;
+        ctx.beginPath();
+        const sh0 = toS(hole[0]); ctx.moveTo(sh0.x, sh0.y);
+        for (let i = 1; i < hole.length; i++) { ctx.lineTo(toS(hole[i]).x, toS(hole[i]).y); }
+        ctx.closePath();
+        ctx.fillStyle = "#ffffff"; ctx.fill();
+        ctx.strokeStyle = "#93c5fd"; ctx.lineWidth = 1; ctx.stroke();
       }
 
-      const S = Math.min(3, 300 / Math.max(g.width, g.height));
-      const cw = Math.round(g.width * S + 48);
-      const ch = Math.round(g.height * S + 120); // v11: aumentado para não cortar labels abaixo da peça
-      const canvas = document.createElement("canvas");
-      canvas.width = cw; canvas.height = ch;
-      const ctx = canvas.getContext("2d")!;
-      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cw, ch);
-
-      const ox = 24, oy = 24;
-      const pw = g.width * S, ph = g.height * S;
-
-      if (poly.length > 0) {
-        let pminX = Infinity, pminY = Infinity;
-        for (const p of poly) { if (p.x < pminX) pminX = p.x; if (p.y < pminY) pminY = p.y; }
-        const toS = (p: {x:number;y:number}) => ({ x: ox + (p.x - pminX) * S, y: oy + (p.y - pminY) * S });
-
-        ctx.beginPath();
-        const sp0 = toS(poly[0]); ctx.moveTo(sp0.x, sp0.y);
-        for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
-        ctx.closePath();
-        ctx.fillStyle = "#e8f4fd"; ctx.fill();
-        ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5; ctx.stroke();
-
-        for (const hole of holes) {
-          if (!hole.length) continue;
-          ctx.beginPath();
-          const sh0 = toS(hole[0]); ctx.moveTo(sh0.x, sh0.y);
-          for (let i = 1; i < hole.length; i++) { const sh = toS(hole[i]); ctx.lineTo(sh.x, sh.y); }
-          ctx.closePath();
-          ctx.fillStyle = "#fff"; ctx.fill();
-          ctx.strokeStyle = "#93c5fd"; ctx.lineWidth = 1; ctx.stroke();
+      // LED dots
+      if (ledModel && positions.length) {
+        const rawW = bestRotation === 90 ? ledModel.height : ledModel.width;
+        const rawH = bestRotation === 90 ? ledModel.width  : ledModel.height;
+        const lw = Math.max(3, rawW * S);
+        const lh = Math.max(3, rawH * S);
+        for (const pos of positions) {
+          const lx = ox + (pos.x - pminX) * S;
+          const ly = oy + (pos.y - pminY) * S;
+          // Outer glow
+          ctx.beginPath(); ctx.arc(lx, ly, Math.max(lw, lh) * 0.7, 0, Math.PI * 2);
+          ctx.fillStyle = "#fef9c3"; ctx.fill();
+          // LED rect
+          ctx.fillStyle = "#fbbf24"; ctx.strokeStyle = "#92400e"; ctx.lineWidth = 0.5;
+          ctx.fillRect(lx - lw/2, ly - lh/2, lw, lh);
+          ctx.strokeRect(lx - lw/2, ly - lh/2, lw, lh);
         }
-
-        if (ledModel) {
-          const { positions, bestRotation: partRot } = calcLedsForPart(poly, holes, ledModel, 0, letterHeight, ledRotation, ledEngine);
-          const rawW = partRot === 90 ? ledModel.height : ledModel.width;
-          const rawH = partRot === 90 ? ledModel.width : ledModel.height;
-          const ledW = Math.max(1.5, rawW * S);
-          const ledH = Math.max(1.5, rawH * S);
-          for (const pos of positions) {
-            const lx = ox + (pos.x - pminX) * S;
-            const ly = oy + (pos.y - pminY) * S;
-            ctx.fillStyle = "#facc15"; ctx.strokeStyle = "#d97706"; ctx.lineWidth = 0.5;
-            ctx.fillRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
-            ctx.strokeRect(lx - ledW/2, ly - ledH/2, ledW, ledH);
+      }
+    } else {
+      // bbox fallback
+      ctx.fillStyle = "#dbeafe"; ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5;
+      ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
+      if (ledModel) {
+        const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
+        const lw = Math.max(3, ledModel.width * S);
+        const lh = Math.max(3, ledModel.height * S);
+        for (let row = 0; row < ledsY; row++) {
+          for (let col = 0; col < ledsX; col++) {
+            const lx = ox + (col + 0.5) * (pw / Math.max(ledsX, 1));
+            const ly = oy + (row + 0.5) * (ph / Math.max(ledsY, 1));
+            ctx.fillStyle = "#fbbf24"; ctx.fillRect(lx - lw/2, ly - lh/2, lw, lh);
           }
         }
-      } else {
-        ctx.fillStyle = "#e8f4fd"; ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5;
-        ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
       }
-
-      const ledLabel = ledModel ? `${ledModel.name}  |  ${totalLeds} LEDs  |  pitch ${pitch.toFixed(1)}mm` : "Sem LED";
-      ctx.fillStyle = "#111"; ctx.font = "bold 10px monospace";
-      ctx.textAlign = "center"; ctx.textBaseline = "top";
-      ctx.fillText(`${g.width.toFixed(0)}×${g.height.toFixed(0)}mm  |  ${ledLabel}  |  ×${g.quantity}pç`, cw/2, oy + ph + 6);
-      ledUrls.push(canvas.toDataURL("image/png"));
     }
+
+    // Dimension annotations on the drawing
+    ctx.fillStyle = "#1e3a5f";
+    ctx.font = "bold 9px 'Courier New', monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText(`${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`, CANVAS_W / 2, CANVAS_H - 3);
+
+    ledCards.push({
+      dataUrl: canvas.toDataURL("image/png"),
+      partLabel: `${g.width.toFixed(0)} × ${g.height.toFixed(0)} mm`,
+      ledName:   ledModel?.name ?? "–",
+      ledDims:   ledModel ? `${ledModel.width} × ${ledModel.height} mm` : "–",
+      ledsPerPiece,
+      totalLeds: ledsPerPiece * g.quantity,
+      pitchX, pitchY,
+      quantity: g.quantity,
+      power: ledModel ? ledsPerPiece * ledModel.power : 0,
+    });
   }
 
+  // ── Helpers ───────────────────────────────────────────────────────────────
   const now = new Date().toLocaleString("pt-BR");
   const totalParts = result.sheets.reduce((s, sh) => s + sh.length, 0);
-  const letterInfo = letterHeight ? `Altura da letra: ${letterHeight}mm · Pitch: ${(
-    calcPitchFromLetterHeight(letterHeight, globalLed?.width ?? 1, globalLed?.height ?? 1) as { pitchX: number; pitchY: number }
-  ).pitchX.toFixed(1)}mm` : "";
+  const pitchLabel = letterHeight && globalLed
+    ? (calcPitchFromLetterHeight(letterHeight, globalLed.width, globalLed.height) as {pitchX:number;pitchY:number}).pitchX.toFixed(1) + " mm"
+    : "—";
 
-  let html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Plano de Corte – ${fileName}</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Courier New', monospace; background: #fff; color: #111; padding: 24px; }
-  h1 { font-size: 18px; font-weight: 700; border-bottom: 2px solid #111; padding-bottom: 8px; margin-bottom: 4px; }
-  .meta { font-size: 11px; color: #555; margin-bottom: 20px; }
-  .section { margin-bottom: 28px; }
-  .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-bottom: 12px; color: #333; }
-  .sheet-block { page-break-inside: avoid; margin-bottom: 24px; }
-  .sheet-label { font-size: 11px; font-weight: 700; margin-bottom: 6px; }
-  .sheet-img { border: 1px solid #bbb; display: block; max-width: 100%; }
-  table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th { background: #f3f4f6; text-align: right; padding: 5px 8px; border: 1px solid #ddd; font-weight: 700; }
-  th:first-child { text-align: left; }
-  td { padding: 4px 8px; border: 1px solid #eee; text-align: right; }
-  td:first-child { text-align: left; }
-  tr:nth-child(even) td { background: #f9fafb; }
-  .total-row td { font-weight: 700; background: #f3f4f6 !important; border-top: 2px solid #bbb; }
-  .led-grid { display: flex; flex-wrap: wrap; gap: 16px; }
-  .led-card { border: 1px solid #ddd; padding: 8px; page-break-inside: avoid; }
-  .led-img { display: block; border: 1px solid #eee; }
-  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-  .stat-box { border: 1px solid #ddd; padding: 10px; }
-  .stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; }
-  .stat-val { font-size: 20px; font-weight: 700; }
-  @media print {
-    body { padding: 12px; }
-    .no-print { display: none; }
-    @page { margin: 1cm; size: A4 landscape; }
-  }
-</style></head><body>`;
+  // ── CSS ───────────────────────────────────────────────────────────────────
+  const css = `
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 10px; }
+body {
+  font-family: 'Courier New', Courier, monospace;
+  color: #111;
+  background: #fff;
+  padding: 10mm 10mm 10mm 10mm;
+  max-width: 210mm;
+  margin: 0 auto;
+}
 
-  html += `<h1>📐 Plano de Corte e LED</h1>
-<div class="meta">Arquivo: <b>${fileName}</b> &nbsp;|&nbsp; Gerado: ${now} &nbsp;|&nbsp; Chapa: ${opts.sheetWidth}×${opts.sheetHeight}mm &nbsp;|&nbsp; Folga: ${opts.gap}mm &nbsp;|&nbsp; Margem: ${opts.margin}mm${letterInfo ? ` &nbsp;|&nbsp; ${letterInfo}` : ""}</div>`;
+/* ── header ── */
+.doc-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  border-bottom: 2.5px solid #1e293b;
+  padding-bottom: 5px;
+  margin-bottom: 8px;
+  gap: 12px;
+}
+.doc-title { font-size: 13px; font-weight: 700; letter-spacing: -.3px; }
+.doc-sub   { font-size: 8px; color: #555; margin-top: 2px; line-height: 1.6; }
+.doc-meta  { text-align: right; font-size: 8px; color: #555; line-height: 1.6; white-space: nowrap; }
 
-  html += `<div class="section"><div class="section-title">Resumo</div>
-<div class="stats-grid">
-  <div class="stat-box"><div class="stat-label">Chapas usadas</div><div class="stat-val">${result.sheets.length}</div></div>
-  <div class="stat-box"><div class="stat-label">Peças posicionadas</div><div class="stat-val">${totalParts}</div></div>
-  <div class="stat-box"><div class="stat-label">Aproveitamento</div><div class="stat-val">${(result.utilization * 100).toFixed(1)}%</div></div>
+/* ── section ── */
+.sec { margin-bottom: 10px; }
+.sec-title {
+  font-size: 8px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 1px;
+  color: #fff; background: #1e293b;
+  padding: 2px 7px; margin-bottom: 6px;
+  display: block;
+}
+
+/* ── summary ── */
+.summary {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.kpi { border: 1px solid #d1d5db; padding: 4px 6px; }
+.kpi-label { font-size: 7px; text-transform: uppercase; letter-spacing: .4px; color: #6b7280; }
+.kpi-val   { font-size: 15px; font-weight: 700; line-height: 1.1; }
+.green { color: #15803d; } .blue { color: #1d4ed8; } .amber { color: #b45309; }
+
+/* ── sheet images ── */
+.sheet-block { margin-bottom: 8px; page-break-inside: avoid; }
+.sheet-label { font-size: 8px; font-weight: 700; margin-bottom: 3px; }
+.sheet-img   { display: block; width: 100%; border: 1px solid #94a3b8; }
+
+/* ── LED card grid ── */
+/* 3 cards per row on A4 portrait — each ~60mm wide */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+}
+.card {
+  border: 1.5px solid #cbd5e1;
+  page-break-inside: avoid;
+  overflow: hidden;
+  background: #fff;
+}
+.card-img  { display: block; width: 100%; border-bottom: 1px solid #e2e8f0; }
+.card-body { padding: 5px 6px; background: #f8fafc; }
+.card-name {
+  font-size: 9px; font-weight: 700;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 4px;
+  border-bottom: 1px solid #e2e8f0; padding-bottom: 3px;
+}
+.card-badge {
+  display: inline-block;
+  background: #1e293b; color: #fff;
+  font-size: 7px; font-weight: 700;
+  padding: 1px 5px; border-radius: 2px;
+  margin-bottom: 4px;
+}
+.card-row { display: flex; justify-content: space-between; font-size: 8px; color: #374151; margin-top: 2px; }
+.card-val { font-weight: 700; color: #111; }
+/* highlight total leds row */
+.card-row.hl { background:#fef9c3; margin: 2px -6px; padding: 2px 6px; border-top: 1px solid #fde047; border-bottom: 1px solid #fde047; }
+.card-row.hl .card-val { color: #92400e; font-size: 9px; }
+
+/* ── BOM table ── */
+table { width: 100%; border-collapse: collapse; font-size: 8.5px; }
+thead th {
+  background: #1e293b; color: #fff;
+  font-size: 7.5px; font-weight: 700;
+  text-align: right; padding: 3px 5px;
+  border: 1px solid #334155;
+  white-space: nowrap;
+}
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+tbody td {
+  font-size: 8px; padding: 2.5px 5px;
+  border: 1px solid #e5e7eb; text-align: right;
+  white-space: nowrap;
+}
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+tbody tr:nth-child(even) td { background: #f9fafb; }
+tfoot td {
+  font-size: 8.5px; font-weight: 700; padding: 3px 5px;
+  border: 1px solid #cbd5e1; text-align: right;
+  background: #f1f5f9; border-top: 2px solid #1e293b;
+  white-space: nowrap;
+}
+tfoot td:first-child { text-align: left; }
+
+/* ── highlight totals ── */
+.total-leds { color: #92400e; font-size: 10px !important; }
+
+/* ── print ── */
+@media print {
+  body { padding: 7mm; }
+  .no-print { display: none !important; }
+  @page { size: A4 portrait; margin: 7mm; }
+  .page-break { page-break-before: always; break-before: page; }
+  .card { break-inside: avoid; }
+  .sheet-block { break-inside: avoid; }
+}
+
+/* ── no-print buttons ── */
+.no-print {
+  position: fixed; top: 10px; right: 10px; z-index: 9999;
+  display: flex; gap: 8px;
+}
+.btn {
+  border: none; padding: 8px 16px; font-size: 11px;
+  cursor: pointer; font-family: monospace; font-weight: 700;
+  border-radius: 3px;
+}
+.btn-print { background: #1e293b; color: #fff; }
+.btn-print:hover { background: #0f172a; }
+.btn-close { background: #64748b; color: #fff; }
+`;
+
+  // ── HTML assembly ─────────────────────────────────────────────────────────
+  let html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plano LED — ${fileName}</title>
+<style>${css}</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="doc-header">
+  <div>
+    <div class="doc-title">📐 Plano de Corte e Posicionamento LED</div>
+    <div class="doc-sub">
+      Arquivo: <b>${fileName}</b> &nbsp;·&nbsp;
+      Chapa: <b>${opts.sheetWidth} × ${opts.sheetHeight} mm</b> &nbsp;·&nbsp;
+      Folga: ${opts.gap} mm &nbsp;·&nbsp; Margem: ${opts.margin} mm<br>
+      Motor LED: <b>${ledEngine === "ai" ? "IA (Claude API)" : "Grid colmeia"}</b>
+      ${letterHeight ? ` &nbsp;·&nbsp; Altura da letra: <b>${letterHeight} mm</b> &nbsp;·&nbsp; Pitch: <b>${pitchLabel}</b>` : ""}
+      ${globalLed ? ` &nbsp;·&nbsp; LED padrão: <b>${globalLed.name}</b> (${globalLed.width} × ${globalLed.height} mm)` : ""}
+    </div>
+  </div>
+  <div class="doc-meta">
+    Gerado: ${now}<br>
+    NestCNC v12.1
+  </div>
+</div>
+
+<!-- SUMMARY KPIs -->
+<div class="summary">
+  <div class="kpi"><div class="kpi-label">Chapas usadas</div><div class="kpi-val blue">${result.sheets.length}</div></div>
+  <div class="kpi"><div class="kpi-label">Peças total</div><div class="kpi-val">${totalParts}</div></div>
+  <div class="kpi"><div class="kpi-label">Modelos</div><div class="kpi-val">${groups.length}</div></div>
+  <div class="kpi"><div class="kpi-label">Aproveitamento</div><div class="kpi-val green">${(result.utilization * 100).toFixed(1)}%</div></div>
+  ${ledSummary ? `
+  <div class="kpi"><div class="kpi-label">Total LEDs</div><div class="kpi-val amber">${ledSummary.totalLeds.toLocaleString("pt-BR")}</div></div>
+  <div class="kpi"><div class="kpi-label">Potência</div><div class="kpi-val">${ledSummary.totalPower.toFixed(1)} W</div></div>
+  ` : `<div class="kpi"></div><div class="kpi"></div>`}
 </div>`;
 
-  if (ledSummary) {
-    html += `<div class="stats-grid">
-  <div class="stat-box"><div class="stat-label">Total de LEDs</div><div class="stat-val">${ledSummary.totalLeds.toLocaleString("pt-BR")}</div></div>
-  <div class="stat-box"><div class="stat-label">Potência total</div><div class="stat-val">${ledSummary.totalPower.toFixed(1)} W</div></div>
-  <div class="stat-box"><div class="stat-label">Rotação LED</div><div class="stat-val">Auto</div></div>
-</div>`;
-  }
-  html += `</div>`;
-
-  html += `<div class="section"><div class="section-title">Chapas de Corte</div>`;
+  // ── SHEET PAGES ───────────────────────────────────────────────────────────
+  html += `<div class="sec"><span class="sec-title">Chapas de Corte</span>`;
   for (let si = 0; si < result.sheets.length; si++) {
     const sh = result.sheets[si];
+    if (si > 0) html += `<div class="page-break"></div>`;
     html += `<div class="sheet-block">
-<div class="sheet-label">Chapa ${si + 1} — ${sh.length} peça(s)</div>
-<img class="sheet-img" src="${sheetDataUrls[si]}" />
+  <div class="sheet-label">Chapa ${si + 1} / ${result.sheets.length} — ${sh.length} peça(s) posicionada(s)</div>
+  <img class="sheet-img" src="${sheetDataUrls[si]}" />
 </div>`;
   }
   html += `</div>`;
 
-  if (ledUrls.length) {
-    html += `<div class="section"><div class="section-title">Plano de Posicionamento LED${letterHeight ? ` (altura letra ${letterHeight}mm)` : ""}</div>
-<div class="led-grid">`;
-    groups.forEach((g, gi) => {
-      html += `<div class="led-card"><img class="led-img" src="${ledUrls[gi]}" /></div>`;
-    });
+  // ── LED CARDS — one page per group of 6 ───────────────────────────────────
+  if (ledCards.length > 0) {
+    html += `<div class="page-break"></div>`;
+    html += `<div class="sec"><span class="sec-title">Posicionamento de LEDs — Detalhamento por Modelo de Peça</span>`;
+    html += `<div class="card-grid">`;
+
+    for (let ci = 0; ci < ledCards.length; ci++) {
+      const card = ledCards[ci];
+      // page break every 6 cards (2 rows of 3)
+      if (ci > 0 && ci % 6 === 0) {
+        html += `</div><div class="page-break"></div><div class="card-grid">`;
+      }
+      html += `
+<div class="card">
+  <img class="card-img" src="${card.dataUrl}" alt="Peça ${ci + 1}" />
+  <div class="card-body">
+    <div class="card-badge">×${card.quantity} peça${card.quantity !== 1 ? "s" : ""}</div>
+    <div class="card-name" title="${card.ledName}">${card.ledName}</div>
+    <div class="card-row"><span>Peça (mm)</span><span class="card-val">${card.partLabel}</span></div>
+    <div class="card-row"><span>Módulo LED</span><span class="card-val">${card.ledDims}</span></div>
+    <div class="card-row"><span>Pitch X / Y</span><span class="card-val">${card.pitchX.toFixed(1)} / ${card.pitchY.toFixed(1)} mm</span></div>
+    <div class="card-row hl"><span>LEDs / peça</span><span class="card-val">${card.ledsPerPiece} un</span></div>
+    <div class="card-row hl"><span>Total módulos</span><span class="card-val">${card.totalLeds.toLocaleString("pt-BR")} un</span></div>
+    <div class="card-row"><span>Potência/peça</span><span class="card-val">${card.power.toFixed(1)} W</span></div>
+  </div>
+</div>`;
+    }
     html += `</div></div>`;
   }
 
-  if (ledSummary) {
-    html += `<div class="section"><div class="section-title">Detalhamento de LEDs por Modelo</div>
-<table><thead><tr>
-<th>Dimensões (mm)</th><th>LED usado</th><th>Qtd</th><th>Pitch (mm)</th><th>LEDs/peça</th><th>Total LEDs</th><th>Potência (W)</th>
-</tr></thead><tbody>`;
+  // ── BOM TABLE ─────────────────────────────────────────────────────────────
+  if (ledSummary && ledSummary.rows.length > 0) {
+    html += `<div class="page-break"></div>`;
+    html += `<div class="sec">
+<span class="sec-title">Lista de Materiais — LEDs (BOM)</span>
+<table>
+<thead><tr>
+  <th>Peça (mm)</th>
+  <th>Módulo LED</th>
+  <th>Dim. módulo</th>
+  <th>Qtd peças</th>
+  <th>LEDs/peça</th>
+  <th>Pitch X</th>
+  <th>Pitch Y</th>
+  <th>Total módulos</th>
+  <th>Pot/peça (W)</th>
+  <th>Pot total (W)</th>
+</tr></thead>
+<tbody>`;
+
     for (const row of ledSummary.rows) {
-      html += `<tr><td>${row.width.toFixed(0)} × ${row.height.toFixed(0)}</td><td>${row.ledName}</td><td>${row.qty}</td><td>${row.pitch.toFixed(1)}</td><td>${row.ledsPerPiece}</td><td>${row.totalLeds}</td><td>${row.totalPower.toFixed(1)}</td></tr>`;
+      const lm = ledModels.find(l => l.name === row.ledName);
+      const dimStr = lm ? `${lm.width} × ${lm.height}` : "–";
+      const powerPerPiece = lm ? (row.ledsPerPiece * lm.power).toFixed(2) : "–";
+      html += `<tr>
+  <td>${row.width.toFixed(0)} × ${row.height.toFixed(0)}</td>
+  <td>${row.ledName}</td>
+  <td>${dimStr} mm</td>
+  <td>${row.qty}</td>
+  <td><b>${row.ledsPerPiece}</b></td>
+  <td>${row.pitchX.toFixed(1)} mm</td>
+  <td>${row.pitchY.toFixed(1)} mm</td>
+  <td><b class="total-leds">${row.totalLeds.toLocaleString("pt-BR")}</b></td>
+  <td>${powerPerPiece}</td>
+  <td><b>${row.totalPower.toFixed(2)}</b></td>
+</tr>`;
     }
-    html += `</tbody><tfoot><tr class="total-row"><td colspan="5">TOTAL</td><td>${ledSummary.totalLeds.toLocaleString("pt-BR")}</td><td>${ledSummary.totalPower.toFixed(1)}</td></tr></tfoot></table></div>`;
+
+    html += `</tbody>
+<tfoot><tr>
+  <td colspan="7">TOTAL GERAL</td>
+  <td class="total-leds"><b>${ledSummary.totalLeds.toLocaleString("pt-BR")}</b></td>
+  <td>—</td>
+  <td><b>${ledSummary.totalPower.toFixed(2)} W</b></td>
+</tr></tfoot>
+</table>
+</div>`;
   }
 
-  html += `<div class="no-print" style="position:fixed;top:16px;right:16px;">
-<button onclick="window.print()" style="background:#111;color:#fff;border:none;padding:10px 20px;font-size:14px;cursor:pointer;font-family:monospace;">🖨️ Imprimir</button>
-</div>`;
-  html += `</body></html>`;
+  // ── PRINT BUTTON ──────────────────────────────────────────────────────────
+  html += `
+<div class="no-print">
+  <button class="btn btn-print" onclick="window.print()">🖨️ Imprimir A4</button>
+  <button class="btn btn-close" onclick="window.close()">✕ Fechar</button>
+</div>
+</body>
+</html>`;
 
   win.document.write(html);
   win.document.close();
-  setTimeout(() => win.focus(), 300);
+  setTimeout(() => { win.focus(); }, 300);
 }
 
 // ─── Main App ──────────────────────────────────────────────────────────────
@@ -1272,14 +1534,17 @@ export default function NestingApp() {
   const selectedLed = ledModels.find((l) => l.id === selectedLedId) ?? null;
   const ledNeedsUpdate = selectedLedId !== renderedLedId;
 
-  // Assign a specific LED to a group
+  // Assign a specific LED to a group — clears AI cache for that group so recalculation happens
   const assignLedToGroup = useCallback((groupKey: string, ledId: string) => {
+    aiLedCache.clear(); // force full recalc for AI engine
     setLedAssignments((prev) => ({ ...prev, [groupKey]: ledId }));
+    setRenderedLedId(ledId); // ensure canvas resolves immediately
     setLedKey((k) => k + 1);
   }, []);
 
   // Clear assignment (revert to global)
   const clearGroupAssignment = useCallback((groupKey: string) => {
+    aiLedCache.clear();
     setLedAssignments((prev) => {
       const next = { ...prev };
       delete next[groupKey];
@@ -1293,13 +1558,16 @@ export default function NestingApp() {
     setRenderedLedId(selectedLedId);
   }, [selectedLedId]);
 
-  // Auto-recalculate when LED model, module selection, letter height, or engine changes
+  // Auto-recalculate when LED model, module selection, letter height, engine, or per-group assignment changes
+  const ledModelsKey = JSON.stringify(ledModels.map(l => `${l.id}:${l.width}x${l.height}`));
+  const ledAssignmentsKey = JSON.stringify(ledAssignments);
   useEffect(() => {
-    if (selectedLedId) {
-      setRenderedLedId(selectedLedId);
-      setLedKey((k) => k + 1);
-    }
-  }, [selectedLedId, letterHeight, ledEngine, ledAssignments, JSON.stringify(ledModels)]);
+    // always bump key when anything LED-related changes — covers per-group swap
+    setRenderedLedId(selectedLedId);
+    setLedKey((k) => k + 1);
+    // clear AI cache so re-assignment triggers fresh AI calculation
+    aiLedCache.clear();
+  }, [selectedLedId, letterHeight, ledEngine, ledAssignmentsKey, ledModelsKey]);
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
