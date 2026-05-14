@@ -541,7 +541,7 @@ function renderSheet(
     ctx.fillStyle = color + "40";
     ctx.fill();
     ctx.strokeStyle = color;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1;
     ctx.stroke();
 
     for (const hole of part.holes) {
@@ -883,7 +883,7 @@ function LedDrawingCanvas({
         ctx.fillStyle = engine === "ai" ? "#dcfce7" : "#1e3a5f";
         ctx.fill();
         ctx.strokeStyle = engine === "ai" ? "#16a34a" : "#3b82f6";
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 1;
         ctx.stroke();
 
         for (const hole of holes) {
@@ -1011,7 +1011,7 @@ function LedDrawingCanvas({
       } else {
         ctx.fillStyle = engine === "ai" ? "#dcfce7" : "#1e3a5f";
         ctx.strokeStyle = engine === "ai" ? "#16a34a" : "#3b82f6";
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 1;
         ctx.fillRect(ox, oy, pw, ph);
         ctx.strokeRect(ox, oy, pw, ph);
 
@@ -1173,7 +1173,7 @@ function printPlan(
       for (let i = 1; i < poly.length; i++) { const sp = toS(poly[i]); ctx.lineTo(sp.x, sp.y); }
       ctx.closePath();
       ctx.fillStyle = "#dbeafe"; ctx.fill();
-      ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1; ctx.stroke();
 
       // Holes
       for (const hole of holes) {
@@ -1206,7 +1206,7 @@ function printPlan(
       }
     } else {
       // bbox fallback
-      ctx.fillStyle = "#dbeafe"; ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1.5;
+      ctx.fillStyle = "#dbeafe"; ctx.strokeStyle = "#1d4ed8"; ctx.lineWidth = 1;
       ctx.fillRect(ox, oy, pw, ph); ctx.strokeRect(ox, oy, pw, ph);
       if (ledModel) {
         const { ledsX, ledsY } = calcLedsForBbox(g.width, g.height, ledModel, 0, letterHeight, ledRotation);
@@ -1463,10 +1463,10 @@ tfoot td:first-child { text-align: left; }
     <div class="card-name" title="${card.ledName}">${card.ledName}</div>
     <div class="card-row"><span>Peça (mm)</span><span class="card-val">${card.partLabel}</span></div>
     <div class="card-row"><span>Módulo LED</span><span class="card-val">${card.ledDims}</span></div>
-    <div class="card-row"><span>Pitch X / Y</span><span class="card-val">${card.pitchX.toFixed(1)} / ${card.pitchY.toFixed(1)} mm</span></div>
+    <div class="card-row"><span></span><span class="card-val">${card.pitchX.toFixed(1)} / ${card.pitchY.toFixed(1)} mm</span></div>
     <div class="card-row hl"><span>LEDs / peça</span><span class="card-val">${card.ledsPerPiece} un</span></div>
-    <div class="card-row hl"><span>Total módulos</span><span class="card-val">${card.totalLeds.toLocaleString("pt-BR")} un</span></div>
-    <div class="card-row"><span>Potência/peça</span><span class="card-val">${card.power.toFixed(1)} W</span></div>
+    <div class="card-row hl"><span></span><span class="card-val">${card.totalLeds.toLocaleString("pt-BR")} un</span></div>
+    <div class="card-row"><span></span><span class="card-val">${card.power.toFixed(1)} W</span></div>
   </div>
 </div>`;
     }
@@ -1487,7 +1487,7 @@ tfoot td:first-child { text-align: left; }
   <th>LEDs/peça</th>
   <th>Pitch X</th>
   <th>Pitch Y</th>
-  <th>Total módulos</th>
+  <th></th>
   <th>Pot/peça (W)</th>
   <th>Pot total (W)</th>
 </tr></thead>
