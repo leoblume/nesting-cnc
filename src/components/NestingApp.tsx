@@ -504,14 +504,14 @@ function renderSheet(
   const ctx = canvas.getContext("2d")!;
   ctx.scale(dpr, dpr);
 
-  ctx.fillStyle = "#1e293b";
+  ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, drawW, drawH);
-  ctx.strokeStyle = "#475569";
+  ctx.strokeStyle = "#94a3b8";
   ctx.lineWidth = 1;
   ctx.strokeRect(0.5, 0.5, drawW - 1, drawH - 1);
 
   if (margin > 0) {
-    ctx.strokeStyle = "#334155";
+    ctx.strokeStyle = "#cbd5e1";
     ctx.setLineDash([4, 4]);
     ctx.strokeRect(margin * scale, margin * scale, (sheetWidth - 2 * margin) * scale, (sheetHeight - 2 * margin) * scale);
     ctx.setLineDash([]);
@@ -550,7 +550,7 @@ function renderSheet(
       ctx.moveTo(hole[0].x * scale, hole[0].y * scale);
       for (let i = 1; i < hole.length; i++) ctx.lineTo(hole[i].x * scale, hole[i].y * scale);
       ctx.closePath();
-      ctx.fillStyle = "#1e293b";
+      ctx.fillStyle = "#ffffff";
       ctx.fill();
       ctx.strokeStyle = color + "99";
       ctx.lineWidth = 1;
@@ -1195,9 +1195,6 @@ function printPlan(
         for (const pos of positions) {
           const lx = ox + (pos.x - pminX) * S;
           const ly = oy + (pos.y - pminY) * S;
-          // Outer glow
-          ctx.beginPath(); ctx.arc(lx, ly, Math.max(lw, lh) * 0.7, 0, Math.PI * 2);
-          ctx.fillStyle = "#fef9c3"; ctx.fill();
           // LED rect
           ctx.fillStyle = "#fbbf24"; ctx.strokeStyle = "#92400e"; ctx.lineWidth = 0.5;
           ctx.fillRect(lx - lw/2, ly - lh/2, lw, lh);
@@ -1460,13 +1457,12 @@ tfoot td:first-child { text-align: left; }
   <img class="card-img" src="${card.dataUrl}" alt="Peça ${ci + 1}" />
   <div class="card-body">
     <div class="card-badge">×${card.quantity} peça${card.quantity !== 1 ? "s" : ""}</div>
-    <div class="card-name" title="${card.ledName}">${card.ledName}</div>
+    <div class="card-name" title="${card.ledName}">${card.ledName} — ${card.ledDims}</div>
     <div class="card-row"><span>Peça (mm)</span><span class="card-val">${card.partLabel}</span></div>
-    <div class="card-row"><span>Módulo LED</span><span class="card-val">${card.ledDims}</span></div>
-    <div class="card-row"><span></span><span class="card-val">${card.pitchX.toFixed(1)} / ${card.pitchY.toFixed(1)} mm</span></div>
+    <div class="card-row"><span>Pitch X / Y</span><span class="card-val">${card.pitchX.toFixed(1)} / ${card.pitchY.toFixed(1)} mm</span></div>
     <div class="card-row hl"><span>LEDs / peça</span><span class="card-val">${card.ledsPerPiece} un</span></div>
-    <div class="card-row hl"><span></span><span class="card-val">${card.totalLeds.toLocaleString("pt-BR")} un</span></div>
-    <div class="card-row"><span></span><span class="card-val">${card.power.toFixed(1)} W</span></div>
+    <div class="card-row hl"><span>Total LEDs</span><span class="card-val">${card.totalLeds.toLocaleString("pt-BR")} un</span></div>
+    <div class="card-row"><span>Potência</span><span class="card-val">${card.power.toFixed(1)} W</span></div>
   </div>
 </div>`;
     }
